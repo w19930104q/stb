@@ -1,6 +1,7 @@
 #ifdef __clang__
 #define STBIWDEF static inline
 #endif
+#include <string.h>
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -41,6 +42,7 @@ void image_write_test(void)
    stbi_write_tga("output/wr6x5_regular.tga", 6, 5, 3, img6x5_rgb);
    stbi_write_jpg("output/wr6x5_regular.jpg", 6, 5, 3, img6x5_rgb, 95);
    stbi_write_hdr("output/wr6x5_regular.hdr", 6, 5, 3, img6x5_rgbf);
+   stbi_write_gif("output/wr6x5_regular.gif", 6, 5, 3, img6x5_rgb);
 
    stbi_flip_vertically_on_write(1);
 
@@ -49,6 +51,26 @@ void image_write_test(void)
    stbi_write_tga("output/wr6x5_flip.tga", 6, 5, 3, img6x5_rgb);
    stbi_write_jpg("output/wr6x5_flip.jpg", 6, 5, 3, img6x5_rgb, 95);
    stbi_write_hdr("output/wr6x5_flip.hdr", 6, 5, 3, img6x5_rgbf);
+   stbi_write_gif("output/wr6x5_flip.gif", 6, 5, 3, img6x5_rgb);
+
+   stbi_flip_vertically_on_write(0);
+
+   // a small animated GIF: the F sliding one pixel to the right per frame
+   {
+      stbiw_gif gif;
+      int f;
+      if (stbi_write_gif_begin(&gif, "output/wr6x5_anim.gif", 6, 5, 0)) {
+         for (f = 0; f < 3; ++f) {
+            unsigned char frame[6*5*3];
+            memcpy(frame, img6x5_rgb, sizeof(frame));
+            frame[(f*6 + 3)*3 + 0] = 0;   // punch a moving white hole
+            frame[(f*6 + 3)*3 + 1] = 255;
+            frame[(f*6 + 3)*3 + 2] = 255;
+            stbi_write_gif_frame(&gif, frame, 3, 50);
+         }
+         stbi_write_gif_end(&gif);
+      }
+   }
 }
 
 #ifdef IWT_TEST

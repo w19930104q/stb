@@ -1,3 +1,14 @@
+2026-11-20
+
+---- stb_image_write v1.19
+
+- add GIF writer: stbi_write_gif(), stbi_write_gif_to_func(), and the
+  frame-based stbi_write_gif_begin()/stbi_write_gif_frame()/
+  stbi_write_gif_frame_indexed()/stbi_write_gif_end() API for animations
+  with per-frame local palettes, delays, looping and transparency
+
+====================================================================================
+
 2026-11-19
 
 ---- stb_image.h

@@ -1,4 +1,4 @@
-/* stb_image_write - v1.18 - public domain - http://nothings.org/stb
+/* stb_image_write - v1.19 - public domain - http://nothings.org/stb
    writes out PNG/BMP/TGA/JPEG/HDR images to C stdio - Sean Barrett 2010-2015
                                      no warranty implied; use at your own risk
 
@@ -73,6 +73,38 @@ USAGE:
       void stbi_write_func(void *context, void *data, int size);
 
    There are also four more "_strided" functions for these as well.
+
+   GIF images (including animations) are written with a separate set of
+   functions, since GIF is palette-based and supports multiple frames:
+
+     int stbi_write_gif(char const *filename, int w, int h, int comp, const void *data);
+     int stbi_write_gif_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data);
+
+   These write a single-frame GIF. For animations with per-frame delays
+   and looping, use the frame-based API:
+
+     stbiw_gif gif;
+     stbi_write_gif_begin(&gif, filename, w, h, loop_count); // loop_count: 0=loop forever, N=loop N times, -1=no loop block
+     stbi_write_gif_frame(&gif, pixels, comp, delay_cs);     // delay_cs: frame delay in 1/100s
+     stbi_write_gif_frame(&gif, pixels, comp, delay_cs);     // ...add as many frames as you like
+     stbi_write_gif_end(&gif);
+
+   stbi_write_gif_begin_to_func() is the callback-based variant of
+   stbi_write_gif_begin(). Frames can also be added from palette indices
+   with an explicit palette and an optional transparent palette index
+   (-1 for none):
+
+     int stbi_write_gif_frame_indexed(stbiw_gif *gif, const unsigned char *indices,
+                                      const unsigned char *palette, int num_colors,
+                                      int delay_cs, int transparent_index);
+
+   GIF frames are limited to 256 colors. If a frame contains 256 or fewer
+   distinct colors (counting a transparent color, if any input pixel has
+   alpha < 128), they are reproduced exactly; otherwise the frame is
+   quantized to a 216-color cube and the output is lossy. With comp 2 or
+   comp 4 data, pixels with alpha < 128 are written as transparent. The
+   first frame's palette is stored as the GIF's global color table; every
+   later frame carries its own local color table.
 
    You can configure it with these global variables:
       int stbi_write_tga_with_rle;             // defaults to true; set to 0 to disable RLE
@@ -223,6 +255,30 @@ STBIWDEF int stbi_write_bmp_strided_to_func(stbi_write_func *func, void *context
 STBIWDEF int stbi_write_tga_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_hdr_strided_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_jpg_strided_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void  *data, ptrdiff_t stride_in_bytes, int quality);
+
+// GIF writer (see USAGE above)
+
+typedef struct
+{
+   stbi_write_func *func;
+   void *context;
+   void *file_maybe;      // private: FILE* when writing to a file
+   int w, h;              // canvas size in pixels
+   int loop_count;        // private
+   int frame_count;       // private
+   int header_written;    // private
+   int ok;                // private: 0 once any output operation has failed
+} stbiw_gif;
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_gif(char const *filename, int w, int h, int comp, const void *data);
+STBIWDEF int stbi_write_gif_begin(stbiw_gif *gif, char const *filename, int w, int h, int loop_count);
+#endif
+STBIWDEF int stbi_write_gif_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data);
+STBIWDEF int stbi_write_gif_begin_to_func(stbiw_gif *gif, stbi_write_func *func, void *context, int w, int h, int loop_count);
+STBIWDEF int stbi_write_gif_frame(stbiw_gif *gif, const void *pixels, int comp, int delay_cs);
+STBIWDEF int stbi_write_gif_frame_indexed(stbiw_gif *gif, const unsigned char *indices, const unsigned char *palette, int num_colors, int delay_cs, int transparent_index);
+STBIWDEF int stbi_write_gif_end(stbiw_gif *gif);
 
 STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
 
@@ -1825,9 +1881,504 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
 }
 #endif
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// GIF writer
+//
+// GIF images are palettized (at most 256 colors per frame) and the pixel
+// indices are LZW-compressed. The first frame's palette is written as the
+// global color table; every later frame carries its own local color table.
+
+// smallest GIF color table size (2,4,8,...,256) that can hold n colors
+static int stbiw__gif_table_size(int n)
+{
+   int s = 2;
+   while (s < n)
+      s <<= 1;
+   return s;
+}
+
+static void stbiw__gif_out(stbiw_gif *gif, const void *data, int size)
+{
+   gif->func(gif->context, (void *) data, size);
+}
+
+static void stbiw__gif_putc(stbiw_gif *gif, unsigned int c)
+{
+   unsigned char b = (unsigned char) (c & 0xff);
+   stbiw__gif_out(gif, &b, 1);
+}
+
+static void stbiw__gif_putw(stbiw_gif *gif, unsigned int w) // 16-bit little endian
+{
+   stbiw__gif_putc(gif, w & 0xff);
+   stbiw__gif_putc(gif, (w >> 8) & 0xff);
+}
+
+// bit packer for LZW codes: bits are emitted LSB-first and the resulting
+// byte stream is split into sub-blocks of at most 255 bytes
+typedef struct
+{
+   stbiw_gif *gif;
+   unsigned int bits;
+   int num_bits;
+   unsigned char block[255];
+   int block_len;
+} stbiw__gif_bitbuf;
+
+static void stbiw__gif_bitbuf_flush(stbiw__gif_bitbuf *bb)
+{
+   if (bb->block_len > 0) {
+      stbiw__gif_putc(bb->gif, (unsigned int) bb->block_len);
+      stbiw__gif_out(bb->gif, bb->block, bb->block_len);
+      bb->block_len = 0;
+   }
+}
+
+static void stbiw__gif_bitbuf_put(stbiw__gif_bitbuf *bb, int code, int code_size)
+{
+   bb->bits |= (unsigned int) code << bb->num_bits;
+   bb->num_bits += code_size;
+   while (bb->num_bits >= 8) {
+      bb->block[bb->block_len++] = (unsigned char) (bb->bits & 0xff);
+      bb->bits >>= 8;
+      bb->num_bits -= 8;
+      if (bb->block_len == 255)
+         stbiw__gif_bitbuf_flush(bb);
+   }
+}
+
+// LZW-compress 'count' pixel indices and write them as a GIF image data
+// stream (minimum code size byte + sub-blocks + block terminator)
+static int stbiw__gif_lzw_encode(stbiw_gif *gif, const unsigned char *indices, int count, int min_code_size)
+{
+   // hash table maps (prefix_code << 8) | suffix -> assigned code;
+   // entries pack the code in the high 12 bits and the key in the low 20
+   #define STBIW__GIF_LZW_HASH 8192 // power of two, >= 2*4096 so it can't fill up
+   unsigned int *hash = (unsigned int *) STBIW_MALLOC(STBIW__GIF_LZW_HASH * sizeof(unsigned int));
+   stbiw__gif_bitbuf bb;
+   int clear_code = 1 << min_code_size;
+   int eoi_code = clear_code + 1;
+   int next_code, code_size, prefix, i;
+
+   if (hash == NULL)
+      return 0;
+
+   bb.gif = gif;
+   bb.bits = 0;
+   bb.num_bits = 0;
+   bb.block_len = 0;
+
+   stbiw__gif_putc(gif, (unsigned int) min_code_size);
+
+   memset(hash, 0, STBIW__GIF_LZW_HASH * sizeof(unsigned int));
+   next_code = eoi_code + 1;
+   code_size = min_code_size + 1;
+
+   stbiw__gif_bitbuf_put(&bb, clear_code, code_size);
+
+   prefix = indices[0];
+   for (i = 1; i < count; ++i) {
+      int k = indices[i];
+      unsigned int key = ((unsigned int) prefix << 8) | (unsigned int) k;
+      unsigned int slot = (key * 0x9E3779B1u) >> 19;
+      int code = -1;
+      while (hash[slot] != 0) {
+         if ((hash[slot] & 0xFFFFFu) == key) {
+            code = (int) (hash[slot] >> 20);
+            break;
+         }
+         slot = (slot + 1) & (STBIW__GIF_LZW_HASH - 1);
+      }
+      if (code >= 0) {
+         prefix = code;
+      } else {
+         stbiw__gif_bitbuf_put(&bb, prefix, code_size);
+         // the decoder adds a table entry for every code it reads and
+         // expects wider codes as soon as its table reaches the current
+         // code size limit; its table lags one entry behind the encoder's,
+         // so grow the code size when the next assignable code reaches the
+         // limit (checked before inserting, and again after the final code)
+         if (next_code >= (1 << code_size) && code_size < 12)
+            ++code_size;
+         if (next_code < 4096) {
+            hash[slot] = ((unsigned int) next_code << 20) | key;
+            ++next_code;
+         } else {
+            // dictionary is full: emit a clear code and start over
+            stbiw__gif_bitbuf_put(&bb, clear_code, code_size);
+            memset(hash, 0, STBIW__GIF_LZW_HASH * sizeof(unsigned int));
+            next_code = eoi_code + 1;
+            code_size = min_code_size + 1;
+         }
+         prefix = k;
+      }
+   }
+   stbiw__gif_bitbuf_put(&bb, prefix, code_size);
+   // the decoder adds one last table entry for the final code, which may
+   // push its table to the code size limit before it reads the EOI code
+   if (next_code >= (1 << code_size) && code_size < 12)
+      ++code_size;
+   stbiw__gif_bitbuf_put(&bb, eoi_code, code_size);
+
+   if (bb.num_bits > 0)
+      bb.block[bb.block_len++] = (unsigned char) (bb.bits & 0xff);
+   stbiw__gif_bitbuf_flush(&bb);
+   stbiw__gif_putc(gif, 0); // block terminator
+
+   STBIW_FREE(hash);
+   return 1;
+}
+
+static void stbiw__gif_get_pixel(const unsigned char *px, int comp, unsigned int *r, unsigned int *g, unsigned int *b, unsigned int *a)
+{
+   switch (comp) {
+      case 1:  *r = *g = *b = px[0]; *a = 255; break;
+      case 2:  *r = *g = *b = px[0]; *a = px[1]; break;
+      case 3:  *r = px[0]; *g = px[1]; *b = px[2]; *a = 255; break;
+      default: *r = px[0]; *g = px[1]; *b = px[2]; *a = px[3]; break;
+   }
+}
+
+// convert an image to palette indices. returns the number of palette colors
+// (0 on allocation failure), fills palette (num_colors*3 bytes) and indices
+// (count bytes), and sets *transparent_out to the transparent palette index
+// or -1. exact if the image has few enough distinct colors, otherwise the
+// colors are quantized to a uniform 6x6x6 cube.
+static int stbiw__gif_build_palette(const unsigned char *pixels, int count, int comp, unsigned char *palette, unsigned char *indices, int *transparent_out)
+{
+   #define STBIW__GIF_PAL_HASH 4096 // power of two, >> 256 so it can't fill up
+   unsigned int *hash;
+   int num_colors = 0, transparent = -1, has_transparent = 0, overflow = 0;
+   int i;
+
+   if (comp == 2 || comp == 4) {
+      for (i = 0; i < count; ++i) {
+         if (pixels[i*comp + (comp-1)] < 128) {
+            has_transparent = 1;
+            break;
+         }
+      }
+   }
+
+   hash = (unsigned int *) STBIW_MALLOC(STBIW__GIF_PAL_HASH * sizeof(unsigned int));
+   if (hash == NULL)
+      return 0;
+   memset(hash, 0, STBIW__GIF_PAL_HASH * sizeof(unsigned int));
+
+   if (has_transparent) {
+      transparent = num_colors++;
+      palette[0] = palette[1] = palette[2] = 0;
+   }
+
+   for (i = 0; i < count; ++i) {
+      unsigned int r, g, b, a, rgb, slot;
+      stbiw__gif_get_pixel(pixels + i*comp, comp, &r, &g, &b, &a);
+      if (has_transparent && a < 128) {
+         indices[i] = (unsigned char) transparent;
+         continue;
+      }
+      rgb = (r << 16) | (g << 8) | b;
+      slot = (rgb * 0x9E3779B1u) >> 20;
+      while (hash[slot] != 0) {
+         int idx = (int) hash[slot] - 1;
+         if (palette[idx*3+0] == r && palette[idx*3+1] == g && palette[idx*3+2] == b)
+            break;
+         slot = (slot + 1) & (STBIW__GIF_PAL_HASH - 1);
+      }
+      if (hash[slot] != 0) {
+         indices[i] = (unsigned char) (hash[slot] - 1);
+      } else {
+         if (num_colors == 256) {
+            overflow = 1;
+            break;
+         }
+         palette[num_colors*3+0] = (unsigned char) r;
+         palette[num_colors*3+1] = (unsigned char) g;
+         palette[num_colors*3+2] = (unsigned char) b;
+         hash[slot] = (unsigned int) (num_colors + 1);
+         indices[i] = (unsigned char) num_colors;
+         ++num_colors;
+      }
+   }
+
+   STBIW_FREE(hash);
+
+   if (overflow) {
+      // too many distinct colors: quantize to a uniform 6x6x6 color cube
+      int base;
+      num_colors = 0;
+      if (has_transparent) {
+         transparent = num_colors++;
+         palette[0] = palette[1] = palette[2] = 0;
+      }
+      base = num_colors;
+      for (i = 0; i < 216; ++i) {
+         palette[(base+i)*3+0] = (unsigned char) ((i / 36) * 51);
+         palette[(base+i)*3+1] = (unsigned char) (((i / 6) % 6) * 51);
+         palette[(base+i)*3+2] = (unsigned char) ((i % 6) * 51);
+      }
+      for (i = 0; i < count; ++i) {
+         unsigned int r, g, b, a;
+         stbiw__gif_get_pixel(pixels + i*comp, comp, &r, &g, &b, &a);
+         if (has_transparent && a < 128)
+            indices[i] = (unsigned char) transparent;
+         else
+            indices[i] = (unsigned char) (base + ((r*6) >> 8) * 36 + ((g*6) >> 8) * 6 + ((b*6) >> 8));
+      }
+      num_colors = base + 216;
+   }
+
+   *transparent_out = transparent;
+   return num_colors;
+}
+
+// write one frame: graphic control extension, image descriptor, optional
+// local color table, LZW image data. on the first call also writes the GIF
+// header, logical screen descriptor, global color table and loop extension.
+static int stbiw__gif_write_frame(stbiw_gif *gif, const unsigned char *indices, const unsigned char *palette, int num_colors, int delay_cs, int transparent)
+{
+   int table_size = stbiw__gif_table_size(num_colors);
+   int table_bits = 1;
+   int i;
+
+   while ((1 << table_bits) < table_size)
+      ++table_bits;
+
+   if (!gif->header_written) {
+      stbiw__gif_out(gif, "GIF89a", 6);
+      stbiw__gif_putw(gif, (unsigned int) gif->w);
+      stbiw__gif_putw(gif, (unsigned int) gif->h);
+      stbiw__gif_putc(gif, 0x80 | 0x70 | (unsigned int) (table_bits - 1)); // global table, 8-bit color resolution
+      stbiw__gif_putc(gif, 0); // background color index
+      stbiw__gif_putc(gif, 0); // pixel aspect ratio
+      for (i = 0; i < table_size; ++i) {
+         if (i < num_colors)
+            stbiw__gif_out(gif, palette + i*3, 3);
+         else
+            stbiw__gif_out(gif, "\0\0\0", 3);
+      }
+      if (gif->loop_count >= 0) {
+         // Netscape looping application extension
+         stbiw__gif_putc(gif, 0x21);
+         stbiw__gif_putc(gif, 0xFF);
+         stbiw__gif_putc(gif, 11);
+         stbiw__gif_out(gif, "NETSCAPE2.0", 11);
+         stbiw__gif_putc(gif, 3);
+         stbiw__gif_putc(gif, 1);
+         stbiw__gif_putw(gif, (unsigned int) gif->loop_count);
+         stbiw__gif_putc(gif, 0);
+      }
+      gif->header_written = 1;
+   }
+
+   // graphic control extension: delay, disposal and transparency
+   if (delay_cs < 0) delay_cs = 0;
+   if (delay_cs > 65535) delay_cs = 65535;
+   stbiw__gif_putc(gif, 0x21);
+   stbiw__gif_putc(gif, 0xF9);
+   stbiw__gif_putc(gif, 4);
+   stbiw__gif_putc(gif, (1 << 2) | (unsigned int) (transparent >= 0)); // disposal 1 = do not dispose
+   stbiw__gif_putw(gif, (unsigned int) delay_cs);
+   stbiw__gif_putc(gif, (unsigned int) (transparent >= 0 ? transparent : 0));
+   stbiw__gif_putc(gif, 0);
+
+   // image descriptor: full canvas, not interlaced
+   stbiw__gif_putc(gif, 0x2C);
+   stbiw__gif_putw(gif, 0);
+   stbiw__gif_putw(gif, 0);
+   stbiw__gif_putw(gif, (unsigned int) gif->w);
+   stbiw__gif_putw(gif, (unsigned int) gif->h);
+   if (gif->frame_count == 0) {
+      stbiw__gif_putc(gif, 0); // no local color table, use the global one
+   } else {
+      stbiw__gif_putc(gif, 0x80 | (unsigned int) (table_bits - 1)); // local color table follows
+      for (i = 0; i < table_size; ++i) {
+         if (i < num_colors)
+            stbiw__gif_out(gif, palette + i*3, 3);
+         else
+            stbiw__gif_out(gif, "\0\0\0", 3);
+      }
+   }
+
+   if (!stbiw__gif_lzw_encode(gif, indices, gif->w * gif->h, table_bits < 2 ? 2 : table_bits))
+      return 0;
+
+   ++gif->frame_count;
+   return gif->ok;
+}
+
+STBIWDEF int stbi_write_gif_begin_to_func(stbiw_gif *gif, stbi_write_func *func, void *context, int w, int h, int loop_count)
+{
+   if (w < 1 || h < 1 || w > 65535 || h > 65535)
+      return 0;
+   gif->func = func;
+   gif->context = context;
+   gif->file_maybe = NULL;
+   gif->w = w;
+   gif->h = h;
+   gif->loop_count = loop_count;
+   gif->frame_count = 0;
+   gif->header_written = 0;
+   gif->ok = 1;
+   return 1;
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+static void stbiw__gif_file_write(void *context, void *data, int size)
+{
+   stbiw_gif *gif = (stbiw_gif *) context;
+   if (fwrite(data, 1, (size_t) size, (FILE *) gif->file_maybe) != (size_t) size)
+      gif->ok = 0;
+}
+
+STBIWDEF int stbi_write_gif_begin(stbiw_gif *gif, char const *filename, int w, int h, int loop_count)
+{
+   FILE *f;
+   if (w < 1 || h < 1 || w > 65535 || h > 65535)
+      return 0;
+   f = stbiw__fopen(filename, "wb");
+   if (f == NULL)
+      return 0;
+   stbi_write_gif_begin_to_func(gif, stbiw__gif_file_write, gif, w, h, loop_count);
+   gif->file_maybe = (void *) f;
+   return 1;
+}
+#endif
+
+STBIWDEF int stbi_write_gif_frame_indexed(stbiw_gif *gif, const unsigned char *indices, const unsigned char *palette, int num_colors, int delay_cs, int transparent_index)
+{
+   const unsigned char *order = indices;
+   unsigned char *flipped = NULL;
+   int count, i, result;
+
+   if (!gif->ok || indices == NULL || palette == NULL)
+      return 0;
+   if (num_colors < 1 || num_colors > 256)
+      return 0;
+   if (transparent_index < -1 || transparent_index >= num_colors)
+      return 0;
+   if (gif->h > INT_MAX / gif->w)
+      return 0;
+
+   count = gif->w * gif->h;
+   for (i = 0; i < count; ++i)
+      if (indices[i] >= num_colors)
+         return 0;
+
+   if (stbi__flip_vertically_on_write) {
+      flipped = (unsigned char *) STBIW_MALLOC((size_t) count);
+      if (flipped == NULL)
+         return 0;
+      for (i = 0; i < gif->h; ++i)
+         memcpy(flipped + (size_t) i * gif->w, indices + (size_t) (gif->h - 1 - i) * gif->w, (size_t) gif->w);
+      order = flipped;
+   }
+
+   result = stbiw__gif_write_frame(gif, order, palette, num_colors, delay_cs, transparent_index);
+   if (flipped != NULL)
+      STBIW_FREE(flipped);
+   return result;
+}
+
+STBIWDEF int stbi_write_gif_frame(stbiw_gif *gif, const void *pixels, int comp, int delay_cs)
+{
+   unsigned char palette[256*3];
+   unsigned char *indices;
+   int num_colors, transparent, count, result;
+
+   if (!gif->ok || pixels == NULL || comp < 1 || comp > 4)
+      return 0;
+   if (gif->h > INT_MAX / gif->w)
+      return 0;
+
+   count = gif->w * gif->h;
+   indices = (unsigned char *) STBIW_MALLOC((size_t) count);
+   if (indices == NULL)
+      return 0;
+
+   num_colors = stbiw__gif_build_palette((const unsigned char *) pixels, count, comp, palette, indices, &transparent);
+   if (num_colors == 0) {
+      STBIW_FREE(indices);
+      return 0;
+   }
+
+   if (stbi__flip_vertically_on_write) {
+      int y, w = gif->w, h = gif->h;
+      unsigned char *row = (unsigned char *) STBIW_MALLOC((size_t) w);
+      if (row == NULL) {
+         STBIW_FREE(indices);
+         return 0;
+      }
+      for (y = 0; y < h/2; ++y) {
+         memcpy(row, indices + (size_t) y * w, (size_t) w);
+         memcpy(indices + (size_t) y * w, indices + (size_t) (h - 1 - y) * w, (size_t) w);
+         memcpy(indices + (size_t) (h - 1 - y) * w, row, (size_t) w);
+      }
+      STBIW_FREE(row);
+   }
+
+   result = stbiw__gif_write_frame(gif, indices, palette, num_colors, delay_cs, transparent);
+   STBIW_FREE(indices);
+   return result;
+}
+
+STBIWDEF int stbi_write_gif_end(stbiw_gif *gif)
+{
+   int result;
+   if (!gif->header_written) {
+      // no frames were added; emit a header with a minimal global color
+      // table so the file is still a structurally valid GIF
+      stbiw__gif_out(gif, "GIF89a", 6);
+      stbiw__gif_putw(gif, (unsigned int) gif->w);
+      stbiw__gif_putw(gif, (unsigned int) gif->h);
+      stbiw__gif_putc(gif, 0x80 | 0x70);
+      stbiw__gif_putc(gif, 0);
+      stbiw__gif_putc(gif, 0);
+      stbiw__gif_out(gif, "\0\0\0\0\0\0", 6);
+      gif->header_written = 1;
+   }
+   stbiw__gif_putc(gif, 0x3B); // trailer
+   result = gif->ok;
+#ifndef STBI_WRITE_NO_STDIO
+   if (gif->file_maybe != NULL) {
+      if (fclose((FILE *) gif->file_maybe) != 0)
+         result = 0;
+      gif->file_maybe = NULL;
+   }
+#endif
+   gif->ok = 0;
+   return result;
+}
+
+STBIWDEF int stbi_write_gif_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void *data)
+{
+   stbiw_gif gif;
+   int ok;
+   if (!stbi_write_gif_begin_to_func(&gif, func, context, w, h, -1))
+      return 0;
+   ok = stbi_write_gif_frame(&gif, data, comp, 0);
+   return stbi_write_gif_end(&gif) && ok;
+}
+
+#ifndef STBI_WRITE_NO_STDIO
+STBIWDEF int stbi_write_gif(char const *filename, int w, int h, int comp, const void *data)
+{
+   stbiw_gif gif;
+   int ok;
+   if (!stbi_write_gif_begin(&gif, filename, w, h, -1))
+      return 0;
+   ok = stbi_write_gif_frame(&gif, data, comp, 0);
+   return stbi_write_gif_end(&gif) && ok;
+}
+#endif
+
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
 /* Revision history
+      1.19  (2026-11-20)
+             add GIF writer: single-frame and animated, exact/quantized palettes,
+             local color tables, transparency, LZW compression
       1.16  (2021-07-11)
              make Deflate code emit uncompressed blocks when it would otherwise expand
              support writing BMPs with alpha channel
