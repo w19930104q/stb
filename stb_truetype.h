@@ -1,4 +1,4 @@
-// stb_truetype.h - v1.28 - public domain
+// stb_truetype.h - v1.29 - public domain
 // authored from 2009-2021 by Sean Barrett / RAD Game Tools
 //
 // =======================================================================
@@ -16,6 +16,8 @@
 //        extract glyph shapes
 //        render glyphs to one-channel bitmaps with antialiasing (box filter)
 //        render glyphs to one-channel SDF bitmaps (signed-distance field/function)
+//        render embedded bitmap glyphs (EBLC/EBDT, CBLC/CBDT, bloc/bdat),
+//           including color emoji (raw BGRA, or PNG via stbtt_GetGlyphBitmapPNG)
 //
 //   Todo:
 //        non-MS cmaps
@@ -60,6 +62,8 @@
 //
 // VERSION HISTORY
 //
+//   1.29 (2026-11-20) support embedded bitmap glyphs (EBLC/EBDT, CBLC/CBDT,
+//                     bloc/bdat, sbix), incl. color emoji; allow bitmap-only fonts
 //   1.28 (2026-11-12) several fixes
 //   1.27 (2026-11-08) many fixes, support vertical layout, underlines, font name
 //   1.26 (2021-08-28) fix broken rasterizer
@@ -437,6 +441,18 @@ int main(int arg, char **argv)
    typedef signed   int    stbtt_int32;
    #endif
 
+   // 64-bit types are only used by the embedded-bitmap table parsers to
+   // bounds-check offset arithmetic without overflowing; allow override.
+   #ifndef stbtt_uint64
+   #if defined(_MSC_VER) && _MSC_VER < 1300
+      typedef __int64          stbtt_int64;
+      typedef unsigned __int64 stbtt_uint64;
+   #else
+      typedef signed long long   stbtt_int64;
+      typedef unsigned long long stbtt_uint64;
+   #endif
+   #endif
+
    typedef char stbtt__check_size32[sizeof(stbtt_int32)==4 ? 1 : -1];
    typedef char stbtt__check_size16[sizeof(stbtt_int16)==2 ? 1 : -1];
 
@@ -723,6 +739,8 @@ struct stbtt_fontinfo
    int numGlyphs;                     // number of glyphs, needed for range checking
 
    int loca,head,glyf,hhea,hmtx,vhea,vmtx,kern,gpos,svg; // table locations as offset from start of .ttf
+   int eblc,ebdt,cblc,cbdt,sbix;      // embedded bitmap table locations (0 if not present)
+   int eblc_len,ebdt_len,cblc_len,cbdt_len,sbix_len; // byte lengths of the embedded bitmap tables
    int index_map;                     // a cmap mapping for our chosen character encoding
    int indexToLocFormat;              // format needed to map from glyph index to glyph
 
@@ -935,6 +953,48 @@ STBTT_DEF void stbtt_MakeGlyphBitmapSubpixel(const stbtt_fontinfo *info, unsigne
 STBTT_DEF void stbtt_MakeGlyphBitmapSubpixelPrefilter(const stbtt_fontinfo *info, unsigned char *output, int out_w, int out_h, int out_stride, float scale_x, float scale_y, float shift_x, float shift_y, int oversample_x, int oversample_y, float *sub_x, float *sub_y, int glyph);
 STBTT_DEF void stbtt_GetGlyphBitmapBox(const stbtt_fontinfo *font, int glyph, float scale_x, float scale_y, int *ix0, int *iy0, int *ix1, int *iy1);
 STBTT_DEF void stbtt_GetGlyphBitmapBoxSubpixel(const stbtt_fontinfo *font, int glyph, float scale_x, float scale_y,float shift_x, float shift_y, int *ix0, int *iy0, int *ix1, int *iy1);
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// EMBEDDED BITMAP GLYPHS (color emoji & bitmap-strike fonts)
+//
+// Some fonts (e.g. color emoji fonts like Noto Color Emoji or Apple Color
+// Emoji, and hand-tuned bitmap fonts) store pre-rendered bitmaps for their
+// glyphs in 'EBLC'/'EBDT', 'CBLC'/'CBDT', 'bloc'/'bdat' or 'sbix' tables,
+// instead of (or in addition to) outlines. The regular bitmap functions
+// above (stbtt_GetGlyphBitmap, stbtt_MakeGlyphBitmap, stbtt_GetGlyphBitmapBox,
+// stbtt_BakeFontBitmap, stbtt_PackFontRanges, and the codepoint variants)
+// automatically render embedded grayscale bitmaps for glyphs that have no
+// outline. Embedded bitmaps come in fixed sizes ("strikes"); the requested
+// scale only selects the strike whose pixel size is closest, and the bitmap
+// is returned at that strike's native size (use stbtt_ScaleForMappingEmToPixels
+// to request an exact strike size). Glyphs that have an outline are always
+// rendered from the outline, so outline fonts are unaffected.
+//
+// The functions below additionally provide access to color bitmaps and to
+// the raw embedded PNG data.
+
+STBTT_DEF unsigned char *stbtt_GetGlyphBitmapColor(const stbtt_fontinfo *info, float scale_x, float scale_y, int glyph, int *width, int *height, int *xoff, int *yoff);
+STBTT_DEF unsigned char *stbtt_GetCodepointBitmapColor(const stbtt_fontinfo *info, float scale_x, float scale_y, int codepoint, int *width, int *height, int *xoff, int *yoff);
+// like stbtt_GetGlyphBitmap, but allocates a 4-channel (RGBA) bitmap with
+// 4 bytes per pixel (free it with stbtt_FreeBitmap). If the glyph has an
+// embedded color bitmap (uncompressed BGRA data in CBDT), it is converted
+// to RGBA (note the data is premultiplied, as stored in the font). Embedded
+// grayscale bitmaps and outlines are expanded to white with the coverage in
+// the alpha channel. Returns NULL if the glyph has no renderable data.
+// Glyphs stored as PNG images cannot be decoded by this library; use
+// stbtt_GetGlyphBitmapPNG for those.
+
+STBTT_DEF const unsigned char *stbtt_GetGlyphBitmapPNG(const stbtt_fontinfo *info, float scale_x, float scale_y, int glyph, int *data_len, int *width, int *height, int *xoff, int *yoff);
+STBTT_DEF const unsigned char *stbtt_GetCodepointBitmapPNG(const stbtt_fontinfo *info, float scale_x, float scale_y, int codepoint, int *data_len, int *width, int *height, int *xoff, int *yoff);
+// if the glyph has an embedded PNG bitmap (CBDT formats 17/18/19, or an sbix
+// 'png ' strike, as used by Google's and Apple's color emoji fonts), returns
+// a pointer to the PNG file data inside the font (do NOT free it; it points
+// into the font data) and stores its length in *data_len. Decode it with
+// e.g. stb_image. *width/*height are the bitmap dimensions in pixels and
+// *xoff/*yoff the offset from the glyph origin to the top-left of the bitmap
+// (same convention as stbtt_GetGlyphBitmap). Returns NULL if the glyph has
+// no PNG bitmap.
 
 
 // @TODO: don't expose this structure
@@ -1303,10 +1363,10 @@ static stbtt__buf stbtt__cff_index_get(stbtt__buf b, int i)
 #define ttCHAR(p)     (* (stbtt_int8 *) (p))
 #define ttFixed(p)    ttLONG(p)
 
-static stbtt_uint16 ttUSHORT(stbtt_uint8 *p) { return p[0]*256 + p[1]; }
-static stbtt_int16 ttSHORT(stbtt_uint8 *p)   { return p[0]*256 + p[1]; }
-static stbtt_uint32 ttULONG(stbtt_uint8 *p)  { return (p[0]<<24) + (p[1]<<16) + (p[2]<<8) + p[3]; }
-static stbtt_int32 ttLONG(stbtt_uint8 *p)    { return (p[0]<<24) + (p[1]<<16) + (p[2]<<8) + p[3]; }
+static stbtt_uint16 ttUSHORT(stbtt_uint8 *p) { return (stbtt_uint16)(p[0]*256 + p[1]); }
+static stbtt_int16 ttSHORT(stbtt_uint8 *p)   { return (stbtt_int16)(p[0]*256 + p[1]); }
+static stbtt_uint32 ttULONG(stbtt_uint8 *p)  { return ((stbtt_uint32)p[0]<<24) + ((stbtt_uint32)p[1]<<16) + ((stbtt_uint32)p[2]<<8) + (stbtt_uint32)p[3]; }
+static stbtt_int32 ttLONG(stbtt_uint8 *p)    { return (stbtt_int32) ttULONG(p); }
 
 #define stbtt_tag4(p,c0,c1,c2,c3) ((p)[0] == (c0) && (p)[1] == (c1) && (p)[2] == (c2) && (p)[3] == (c3))
 #define stbtt_tag(p,str)           stbtt_tag4(p,str[0],str[1],str[2],str[3])
@@ -1332,6 +1392,24 @@ static stbtt_uint32 stbtt__find_table(stbtt_uint8 *data, stbtt_uint32 fontstart,
       stbtt_uint32 loc = tabledir + 16*i;
       if (stbtt_tag(data+loc+0, tag))
          return ttULONG(data+loc+8);
+   }
+   return 0;
+}
+
+// like stbtt__find_table, but also returns the table's declared byte length
+// (used to bounds-check the embedded-bitmap table parsers)
+static stbtt_uint32 stbtt__find_table_len(stbtt_uint8 *data, stbtt_uint32 fontstart, const char *tag, stbtt_uint32 *out_len)
+{
+   stbtt_int32 num_tables = ttUSHORT(data+fontstart+4);
+   stbtt_uint32 tabledir = fontstart + 12;
+   stbtt_int32 i;
+   *out_len = 0;
+   for (i=0; i < num_tables; ++i) {
+      stbtt_uint32 loc = tabledir + 16*i;
+      if (stbtt_tag(data+loc+0, tag)) {
+         *out_len = ttULONG(data+loc+12);
+         return ttULONG(data+loc+8);
+      }
    }
    return 0;
 }
@@ -1421,6 +1499,20 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
    info->kern = stbtt__find_table(data, fontstart, "kern"); // not required
    info->gpos = stbtt__find_table(data, fontstart, "GPOS"); // not required
 
+   // embedded bitmap data (not required)
+   {
+      stbtt_uint32 len;
+      info->eblc = stbtt__find_table_len(data, fontstart, "EBLC", &len); info->eblc_len = (int) len;
+      info->ebdt = stbtt__find_table_len(data, fontstart, "EBDT", &len); info->ebdt_len = (int) len;
+      if (!info->eblc) { info->eblc = stbtt__find_table_len(data, fontstart, "bloc", &len); info->eblc_len = (int) len; } // Apple name for EBLC
+      if (!info->ebdt) { info->ebdt = stbtt__find_table_len(data, fontstart, "bdat", &len); info->ebdt_len = (int) len; } // Apple name for EBDT
+      info->cblc = stbtt__find_table_len(data, fontstart, "CBLC", &len); info->cblc_len = (int) len;
+      info->cbdt = stbtt__find_table_len(data, fontstart, "CBDT", &len); info->cbdt_len = (int) len;
+      info->sbix = stbtt__find_table_len(data, fontstart, "sbix", &len); info->sbix_len = (int) len;
+   }
+   if (!info->ebdt) info->eblc = info->eblc_len = 0; // location table is useless without the data table
+   if (!info->cbdt) info->cblc = info->cblc_len = 0;
+
    if (!cmap || !info->head || !info->hhea || !info->hmtx)
       return 0;
    if (info->glyf) {
@@ -1433,7 +1525,12 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
       stbtt_uint32 cff;
 
       cff = stbtt__find_table(data, fontstart, "CFF ");
-      if (!cff) return 0;
+      if (!cff) {
+         // no outline data at all; this is only ok if the font stores
+         // embedded bitmaps instead (e.g. color emoji fonts)
+         if (!info->eblc && !info->cblc && !info->sbix)
+            return 0;
+      } else {
 
       info->fontdicts = stbtt__new_buf(NULL, 0);
       info->fdselect = stbtt__new_buf(NULL, 0);
@@ -1474,6 +1571,7 @@ static int stbtt_InitFont_internal(stbtt_fontinfo *info, unsigned char *data, in
 
       stbtt__buf_seek(&b, charstrings);
       info->charstrings = stbtt__cff_get_index(&b);
+      }
    }
 
    t = stbtt__find_table(data, fontstart, "maxp");
@@ -1646,6 +1744,532 @@ static void stbtt_setvertex(stbtt_vertex *v, stbtt_uint8 type, stbtt_int32 x, st
    v->cy = (stbtt_int16) cy;
 }
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// EMBEDDED BITMAP GLYPHS ("sbits")
+//
+// Support for glyphs stored as pre-rendered bitmaps, as found in color emoji
+// fonts and bitmap-strike fonts. Parses the EBLC/CBLC/bloc (bitmap location),
+// EBDT/CBDT/bdat (bitmap data) and sbix tables. Grayscale bitmaps (EBDT
+// formats 1, 2, 5, 6, 7 and composites 8, 9, at bit depths 1/2/4/8) are
+// decoded to 8-bit coverage values; color bitmaps (CBDT formats 17/18/19,
+// either raw 32-bit BGRA or PNG, and sbix 'png ' data) are exposed through
+// stbtt_GetGlyphBitmapColor / stbtt_GetGlyphBitmapPNG.
+
+typedef struct
+{
+   int width, height;    // size of the bitmap in pixels
+   int xoff, yoff;       // offset from the glyph origin to the left/top of the bitmap
+   int advance;          // horizontal advance in pixels
+   int bit_depth;        // bits per pixel: 1, 2, 4, 8 (grayscale) or 32 (color)
+   int image_format;     // EBDT glyph data format
+   int image_offset;     // absolute offset of the image data in the font file
+   int image_length;     // length of the image data in bytes
+   int eblc, ebdt;       // tables the glyph was found in (for composite glyphs)
+   int eblc_len, ebdt_len; // byte lengths of those tables (bounds checking)
+   int strike;           // BitmapSize record the glyph was found in
+} stbtt__sbit_glyph;
+
+// parse the metrics header of an EBDT glyph data block.
+// data_offset/data_length describe the block and must lie inside the EBDT.
+static int stbtt__parse_sbit_data(const stbtt_fontinfo *info, stbtt__sbit_glyph *g, int data_offset, int data_length, int metrics_in_index, int ebdt, int ebdt_len)
+{
+   stbtt_uint8 *data = info->data;
+   int hdr;
+   if (data_length < 0 || data_offset < ebdt || data_offset > ebdt + ebdt_len)
+      return 0;
+   switch (g->image_format) {
+      case 1: case 2: case 8: // small metrics + data
+         hdr = 5;
+         if (data_length < hdr) return 0;
+         g->height   = data[data_offset+0];
+         g->width    = data[data_offset+1];
+         g->xoff     = ttCHAR(data+data_offset+2);
+         g->yoff     = ttCHAR(data+data_offset+3);
+         g->advance  = data[data_offset+4];
+         g->image_offset = data_offset + 5;
+         g->image_length = data_length - 5;
+         break;
+      case 6: case 7: case 9: // big metrics + data
+         hdr = 8;
+         if (data_length < hdr) return 0;
+         g->height   = data[data_offset+0];
+         g->width    = data[data_offset+1];
+         g->xoff     = ttCHAR(data+data_offset+2);
+         g->yoff     = ttCHAR(data+data_offset+3);
+         g->advance  = data[data_offset+4];
+         g->image_offset = data_offset + 8;
+         g->image_length = data_length - 8;
+         break;
+      case 5: // bit-aligned image data only, metrics come from the index
+         if (!metrics_in_index) return 0;
+         g->image_offset = data_offset;
+         g->image_length = data_length;
+         break;
+      case 17: // small metrics + PNG or raw BGRA data
+         hdr = 9;
+         if (data_length < hdr) return 0;
+         g->height   = data[data_offset+0];
+         g->width    = data[data_offset+1];
+         g->xoff     = ttCHAR(data+data_offset+2);
+         g->yoff     = ttCHAR(data+data_offset+3);
+         g->advance  = data[data_offset+4];
+         g->image_length = (int) ttULONG(data+data_offset+5);
+         g->image_offset = data_offset + 9;
+         break;
+      case 18: // big metrics + PNG or raw BGRA data
+         hdr = 12;
+         if (data_length < hdr) return 0;
+         g->height   = data[data_offset+0];
+         g->width    = data[data_offset+1];
+         g->xoff     = ttCHAR(data+data_offset+2);
+         g->yoff     = ttCHAR(data+data_offset+3);
+         g->advance  = data[data_offset+4];
+         g->image_length = (int) ttULONG(data+data_offset+8);
+         g->image_offset = data_offset + 12;
+         break;
+      case 19: // PNG or raw BGRA data only, metrics come from the index
+         if (!metrics_in_index || data_length < 4) return 0;
+         g->image_length = (int) ttULONG(data+data_offset+0);
+         g->image_offset = data_offset + 4;
+         break;
+      default:
+         return 0;
+   }
+   if (g->image_length < 0 || g->image_offset < ebdt ||
+       (stbtt_uint64) g->image_offset + (stbtt_uint64) g->image_length > (stbtt_uint64) ebdt + (stbtt_uint64) ebdt_len)
+      return 0; // image payload must stay inside the data table
+   return 1;
+}
+
+// look up a glyph within one bitmap strike (a BitmapSize record in EBLC/CBLC)
+static int stbtt__find_sbit_in_strike(const stbtt_fontinfo *info, int eblc, int ebdt, int eblc_len, int ebdt_len, int strike, int glyph, stbtt__sbit_glyph *g)
+{
+   stbtt_uint8 *data = info->data;
+   int start_glyph, end_glyph;
+   int sublist, num_subtables, i;
+
+   // the BitmapSize record is 48 bytes and must lie inside the location table
+   if (strike < eblc || strike + 48 > eblc + eblc_len)
+      return 0;
+
+   start_glyph = ttUSHORT(data + strike + 40);
+   end_glyph   = ttUSHORT(data + strike + 42);
+
+   if (glyph < start_glyph || glyph > end_glyph)
+      return 0;
+
+   sublist       = eblc + (int) ttULONG(data + strike + 0); // IndexSubtableList, offset from EBLC start
+   num_subtables = (int) ttULONG(data + strike + 8);
+   if (num_subtables < 0 || sublist < eblc || sublist > eblc + eblc_len ||
+       (stbtt_int64) sublist + 8*(stbtt_int64) num_subtables > (stbtt_int64) eblc + eblc_len)
+      return 0;
+
+   g->bit_depth = data[strike + 46];
+   g->eblc      = eblc;
+   g->ebdt      = ebdt;
+   g->eblc_len  = eblc_len;
+   g->ebdt_len  = ebdt_len;
+   g->strike    = strike;
+
+   for (i = 0; i < num_subtables; ++i) {
+      int rec   = sublist + 8*i;
+      int first, last;
+      int sub, index_format, image_data, data_offset = 0, data_len = 0, metrics_in_index = 0;
+      if (rec + 8 > eblc + eblc_len)
+         return 0; // subtable array runs past the table
+
+      first = ttUSHORT(data + rec + 0);
+      last  = ttUSHORT(data + rec + 2);
+
+      if (glyph < first || glyph > last)
+         continue;
+
+      sub = sublist + (int) ttULONG(data + rec + 4); // IndexSubtable, offset from the list start
+      if (sub < eblc || sub + 8 > eblc + eblc_len)
+         return 0;
+      index_format    = ttUSHORT(data + sub + 0);
+      g->image_format = ttUSHORT(data + sub + 2);
+      image_data      = ebdt + (int) ttULONG(data + sub + 4); // imageDataOffset, from EBDT start
+      if (image_data < ebdt || (stbtt_uint64) image_data > (stbtt_uint64) ebdt + ebdt_len)
+         return 0;
+
+      switch (index_format) {
+         case 1: { // variable metrics, 4-byte offsets
+            int idx  = glyph - first;
+            int off0, off1;
+            if (idx < 0 || (stbtt_int64) sub + 8 + 4*((stbtt_int64)idx+1) > (stbtt_int64) eblc + eblc_len)
+               return 0;
+            off0 = (int) ttULONG(data + sub + 8 + 4*idx);
+            off1 = (int) ttULONG(data + sub + 8 + 4*idx + 4);
+            if (off0 < 0 || off1 < off0 || (stbtt_uint64) image_data + (stbtt_uint64) off1 > (stbtt_uint64) ebdt + ebdt_len)
+               return 0;
+            if (off0 == off1) return 0; // missing glyph
+            data_offset = image_data + off0;
+            data_len    = off1 - off0;
+            break;
+         }
+         case 2: { // constant metrics, 4-byte offset
+            int image_size, idx = glyph - first;
+            stbtt_int64 off64;
+            if (idx < 0 || sub + 17 > eblc + eblc_len)
+               return 0;
+            image_size = (int) ttULONG(data + sub + 8);
+            if (image_size <= 0)
+               return 0;
+            g->height   = data[sub+12+0]; // bigGlyphMetrics in the index
+            g->width    = data[sub+12+1];
+            g->xoff     = ttCHAR(data+sub+12+2);
+            g->yoff     = ttCHAR(data+sub+12+3);
+            g->advance  = data[sub+12+4];
+            metrics_in_index = 1;
+            off64 = (stbtt_int64)(stbtt_uint64) image_data + (stbtt_int64) idx * image_size;
+            if (off64 < ebdt || off64 + image_size > (stbtt_int64) ebdt + ebdt_len)
+               return 0;
+            data_offset = (int) off64;
+            data_len    = image_size;
+            break;
+         }
+         case 3: { // variable metrics, 2-byte offsets
+            int idx  = glyph - first;
+            int off0, off1;
+            if (idx < 0 || (stbtt_int64) sub + 8 + 2*((stbtt_int64)idx+1) > (stbtt_int64) eblc + eblc_len)
+               return 0;
+            off0 = ttUSHORT(data + sub + 8 + 2*idx);
+            off1 = ttUSHORT(data + sub + 8 + 2*idx + 2);
+            if (off1 < off0 || (stbtt_uint64) image_data + (stbtt_uint64) off1 > (stbtt_uint64) ebdt + ebdt_len)
+               return 0;
+            if (off0 == off1) return 0; // missing glyph
+            data_offset = image_data + off0;
+            data_len    = off1 - off0;
+            break;
+         }
+         case 4: { // sparse glyph array, variable metrics
+            int num = (int) ttULONG(data + sub + 8);
+            int j, off0, off1;
+            if (num < 0 || (stbtt_int64) sub + 12 + 4*((stbtt_int64)num+1) > (stbtt_int64) eblc + eblc_len)
+               return 0;
+            for (j = 0; j < num; ++j)
+               if (ttUSHORT(data + sub + 12 + 4*j) == glyph)
+                  break;
+            if (j == num) return 0; // missing glyph
+            off0 = ttUSHORT(data + sub + 12 + 4*j + 2);
+            off1 = ttUSHORT(data + sub + 12 + 4*j + 6); // one extra pair terminates the array
+            if (off1 < off0 || (stbtt_uint64) image_data + (stbtt_uint64) off1 > (stbtt_uint64) ebdt + ebdt_len)
+               return 0;
+            if (off0 == off1) return 0;
+            data_offset = image_data + off0;
+            data_len    = off1 - off0;
+            break;
+         }
+         case 5: { // constant metrics, sparse glyph id array
+            int image_size = (int) ttULONG(data + sub + 8);
+            int num        = (int) ttULONG(data + sub + 20);
+            int j;
+            stbtt_int64 off64;
+            if (image_size <= 0 || num < 0 || (stbtt_int64) sub + 22 + 2*(stbtt_int64)num > (stbtt_int64) eblc + eblc_len)
+               return 0;
+            g->height   = data[sub+12+0]; // bigGlyphMetrics in the index
+            g->width    = data[sub+12+1];
+            g->xoff     = ttCHAR(data+sub+12+2);
+            g->yoff     = ttCHAR(data+sub+12+3);
+            g->advance  = data[sub+12+4];
+            metrics_in_index = 1;
+            for (j = 0; j < num; ++j)
+               if (ttUSHORT(data + sub + 22 + 2*j) == glyph)
+                  break;
+            if (j == num) return 0; // missing glyph
+            off64 = (stbtt_int64)(stbtt_uint64) image_data + (stbtt_int64) j * image_size;
+            if (off64 < ebdt || off64 + image_size > (stbtt_int64) ebdt + ebdt_len)
+               return 0;
+            data_offset = (int) off64;
+            data_len    = image_size;
+            break;
+         }
+         default:
+            return 0;
+      }
+      return stbtt__parse_sbit_data(info, g, data_offset, data_len, metrics_in_index, ebdt, ebdt_len);
+   }
+   return 0;
+}
+
+// find a glyph's embedded bitmap in one pair of location/data tables,
+// trying strikes in order of how well their size matches the request
+static int stbtt__find_sbit_in_table(const stbtt_fontinfo *info, int eblc, int ebdt, int eblc_len, int ebdt_len, int glyph, float scale_y, stbtt__sbit_glyph *g)
+{
+   stbtt_uint8 *data = info->data;
+   int num_sizes, i, j, upem;
+   float desired;
+   int order[64]; // strikes sorted by distance from the requested size
+
+   if (!eblc || !ebdt || eblc_len < 8 || ebdt_len <= 0)
+      return 0;
+
+   upem     = ttUSHORT(data + info->head + 18);
+   desired  = scale_y * (float) upem; // requested pixels-per-em
+   num_sizes = (int) ttULONG(data + eblc + 4);
+   if (num_sizes < 0 || (stbtt_int64) 8 + 48*(stbtt_int64) num_sizes > eblc_len)
+      return 0; // table too small for the declared strike array
+   if (num_sizes > 64)
+      num_sizes = 64;
+
+   for (i = 0; i < num_sizes; ++i) {
+      int ppem = data[eblc + 8 + 48*i + 45]; // ppemY
+      float diff = desired - (float) ppem;
+      if (diff < 0) diff = -diff;
+      // insertion sort by distance from the requested size
+      for (j = i; j > 0; --j) {
+         int prev_ppem = data[eblc + 8 + 48*order[j-1] + 45];
+         float prev_diff = desired - (float) prev_ppem;
+         if (prev_diff < 0) prev_diff = -prev_diff;
+         if (prev_diff <= diff)
+            break;
+         order[j] = order[j-1];
+      }
+      order[j] = i;
+   }
+
+   for (i = 0; i < num_sizes; ++i)
+      if (stbtt__find_sbit_in_strike(info, eblc, ebdt, eblc_len, ebdt_len, eblc + 8 + 48*order[i], glyph, g))
+         return 1;
+   return 0;
+}
+
+// find a glyph's embedded bitmap, grayscale tables first
+static int stbtt__find_glyph_sbit(const stbtt_fontinfo *info, int glyph, float scale_y, stbtt__sbit_glyph *g)
+{
+   if (stbtt__find_sbit_in_table(info, info->eblc, info->ebdt, info->eblc_len, info->ebdt_len, glyph, scale_y, g)) return 1;
+   if (stbtt__find_sbit_in_table(info, info->cblc, info->cbdt, info->cblc_len, info->cbdt_len, glyph, scale_y, g)) return 1;
+   return 0;
+}
+
+// find a glyph's embedded bitmap, color tables first
+static int stbtt__find_glyph_sbit_color(const stbtt_fontinfo *info, int glyph, float scale_y, stbtt__sbit_glyph *g)
+{
+   if (stbtt__find_sbit_in_table(info, info->cblc, info->cbdt, info->cblc_len, info->cbdt_len, glyph, scale_y, g)) return 1;
+   if (stbtt__find_sbit_in_table(info, info->eblc, info->ebdt, info->eblc_len, info->ebdt_len, glyph, scale_y, g)) return 1;
+   return 0;
+}
+
+static int stbtt__sbit_is_png(const stbtt_fontinfo *info, const stbtt__sbit_glyph *g)
+{
+   if (g->image_format == 17 || g->image_format == 18 || g->image_format == 19) {
+      const stbtt_uint8 *p = info->data + g->image_offset;
+      return g->image_length >= 8 && p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G';
+   }
+   return 0;
+}
+
+// decode one glyph's bitmap into the output buffer with its top-left corner
+// at (ox,oy), clipping to the buffer; pixels are blended with max() so
+// composite glyphs accumulate correctly
+static void stbtt__draw_sbit(const stbtt_fontinfo *info, const stbtt__sbit_glyph *g, unsigned char *output, int out_w, int out_h, int out_stride, int ox, int oy, int depth)
+{
+   stbtt_uint8 *data = info->data;
+   int x, y;
+
+   switch (g->image_format) {
+      case 1: // small metrics, byte-aligned bitmap
+      case 2: // small metrics, bit-aligned bitmap
+      case 5: // metrics in index, bit-aligned bitmap
+      case 6: // big metrics, byte-aligned bitmap
+      case 7: { // big metrics, bit-aligned bitmap
+         int w = g->width, h = g->height;
+         int bits = g->bit_depth;
+         int maxval, byte_aligned, row_bits, row_bytes, needed;
+         const stbtt_uint8 *img;
+         if ((bits != 1 && bits != 2 && bits != 4 && bits != 8) || w <= 0 || h <= 0)
+            break;
+         maxval       = (1 << bits) - 1;
+         byte_aligned = (g->image_format == 1 || g->image_format == 6);
+         row_bits     = w * bits;
+         row_bytes    = (row_bits + 7) >> 3;
+         // make sure the declared pixel data actually fits in the table block
+         needed       = byte_aligned ? row_bytes * h : (row_bits * h + 7) >> 3;
+         if (needed <= 0 || needed > g->image_length)
+            break;
+         img          = data + g->image_offset;
+         for (y = 0; y < h; ++y) {
+            int dy = y + oy;
+            if (dy < 0 || dy >= out_h) continue;
+            for (x = 0; x < w; ++x) {
+               int dx = x + ox;
+               int bitpos, v, old;
+               if (dx < 0 || dx >= out_w) continue;
+               bitpos = (byte_aligned ? y * row_bytes * 8 : y * row_bits) + x * bits;
+               if ((bitpos >> 3) >= g->image_length) continue;
+               v = (img[bitpos >> 3] >> (8 - bits - (bitpos & 7))) & maxval;
+               v = v * 255 / maxval;
+               old = output[dy * out_stride + dx];
+               output[dy * out_stride + dx] = (unsigned char) (v > old ? v : old);
+            }
+         }
+         break;
+      }
+      case 17: case 18: case 19: {
+         // color data; if it's not a PNG image it's raw 32-bit BGRA
+         // (premultiplied), and we use the alpha channel as coverage
+         int w = g->width, h = g->height;
+         const stbtt_uint8 *img;
+         if (g->bit_depth != 32 || stbtt__sbit_is_png(info, g) || w <= 0 || h <= 0)
+            break;
+         if ((stbtt_int64) w * h * 4 > g->image_length)
+            break; // not enough data for the declared BGRA rectangle
+         img = data + g->image_offset;
+         for (y = 0; y < h; ++y) {
+            int dy = y + oy;
+            if (dy < 0 || dy >= out_h) continue;
+            for (x = 0; x < w; ++x) {
+               int dx = x + ox;
+               int v, old;
+               if (dx < 0 || dx >= out_w) continue;
+               v = img[(y*w + x) * 4 + 3];
+               old = output[dy * out_stride + dx];
+               output[dy * out_stride + dx] = (unsigned char) (v > old ? v : old);
+            }
+         }
+         break;
+      }
+      case 8: // small metrics, component data
+      case 9: { // big metrics, component data
+         int num_components, c, i;
+         if (g->image_format == 8) { // one pad byte after the small metrics
+            if (g->image_length < 3) break;
+            num_components = ttUSHORT(data + g->image_offset + 1);
+            c = g->image_offset + 3;
+         } else {
+            if (g->image_length < 2) break;
+            num_components = ttUSHORT(data + g->image_offset + 0);
+            c = g->image_offset + 2;
+         }
+         if (num_components < 0 || c + (stbtt_int64) 4 * num_components > g->image_offset + g->image_length)
+            break; // component array runs past the data block
+         if (depth >= 8) // bail out on cyclic composites
+            break;
+         for (i = 0; i < num_components; ++i) {
+            int comp_glyph = ttUSHORT(data + c + 4*i + 0);
+            int comp_dx    = ttCHAR(data + c + 4*i + 2);
+            int comp_dy    = ttCHAR(data + c + 4*i + 3);
+            stbtt__sbit_glyph comp;
+            if (stbtt__find_sbit_in_strike(info, g->eblc, g->ebdt, g->eblc_len, g->ebdt_len,
+                                           g->strike, comp_glyph, &comp)) {
+               // the component's origin is placed at (dx,dy) relative to this
+               // glyph's origin; convert to a top-left corner in the output
+               int cox = ox - g->xoff + comp_dx + comp.xoff;
+               int coy = oy + g->yoff - comp_dy - comp.yoff;
+               stbtt__draw_sbit(info, &comp, output, out_w, out_h, out_stride, cox, coy, depth + 1);
+            }
+         }
+         break;
+      }
+      default:
+         break;
+   }
+}
+
+// decode a glyph's embedded bitmap as 8-bit coverage values, with the
+// bitmap's top-left corner at (ox,oy) in the output buffer
+static void stbtt__decode_sbit(const stbtt_fontinfo *info, const stbtt__sbit_glyph *g, unsigned char *output, int out_w, int out_h, int out_stride, int ox, int oy)
+{
+   int y;
+   for (y = 0; y < out_h; ++y)
+      STBTT_memset(output + y*out_stride, 0, out_w);
+   stbtt__draw_sbit(info, g, output, out_w, out_h, out_stride, ox, oy, 0);
+}
+
+// parse the dimensions out of a PNG image's IHDR chunk
+static void stbtt__png_dimensions(const stbtt_uint8 *png, int len, int *w, int *h)
+{
+   if (len >= 24 && png[0] == 0x89 && png[1] == 'P' && png[2] == 'N' && png[3] == 'G'
+               && png[12] == 'I' && png[13] == 'H' && png[14] == 'D' && png[15] == 'R') {
+      *w = (int) ttULONG((stbtt_uint8 *) png + 16);
+      *h = (int) ttULONG((stbtt_uint8 *) png + 20);
+   } else {
+      *w = 0;
+      *h = 0;
+   }
+}
+
+// find a glyph's PNG bitmap in an sbix table
+static int stbtt__find_sbix_png(const stbtt_fontinfo *info, int glyph, float scale_y, stbtt__sbit_glyph *g, int depth)
+{
+   stbtt_uint8 *data = info->data;
+   int sbix = info->sbix;
+   int sbix_end = sbix + info->sbix_len;
+   int i, num_strikes, best, off0, off1, glyph_data, upem;
+   float desired, best_diff;
+
+   if (!sbix || info->sbix_len < 8 || depth >= 8 || glyph < 0 || glyph >= info->numGlyphs)
+      return 0;
+
+   upem    = ttUSHORT(data + info->head + 18);
+   desired = scale_y * (float) upem;
+
+   // select the strike whose ppem best matches the requested size
+   num_strikes = (int) ttULONG(data + sbix + 4);
+   if (num_strikes < 0 || (stbtt_int64) 8 + 4*(stbtt_int64) num_strikes > info->sbix_len)
+      return 0; // strike offset table runs past the sbix table
+   best = 0;
+   best_diff = 0;
+   for (i = 0; i < num_strikes; ++i) {
+      int so = (int) ttULONG(data + sbix + 8 + 4*i);
+      int s;
+      int ppem;
+      if (so < 0 || (stbtt_int64) sbix + so + 2 > sbix_end)
+         return 0; // strike outside the table
+      s = sbix + so;
+      ppem = ttUSHORT(data + s + 0);
+      {
+         float diff = desired - (float) ppem;
+         if (diff < 0) diff = -diff;
+         if (best == 0 || diff < best_diff) {
+            best = s;
+            best_diff = diff;
+         }
+      }
+   }
+   if (best == 0)
+      return 0;
+
+   // each strike starts with its own ppem/resolution (4 bytes) followed by
+   // (numGlyphs+1) glyph-data offsets
+   if ((stbtt_int64) best + 8 + 4*((stbtt_int64) glyph + 1) > sbix_end)
+      return 0;
+   off0 = (int) ttULONG(data + best + 4 + 4*glyph);
+   off1 = (int) ttULONG(data + best + 4 + 4*glyph + 4);
+   if (off0 < 0 || off1 < off0 || (stbtt_int64) best + off1 > sbix_end)
+      return 0; // offsets must stay inside the table
+   if (off0 == off1)
+      return 0; // no bitmap for this glyph in this strike
+
+   glyph_data = best + off0;
+   if (glyph_data + 8 > sbix_end)
+      return 0; // need originOffsetX/Y (4) + tag (4)
+   g->xoff = ttSHORT(data + glyph_data + 0); // originOffsetX
+   g->yoff = ttSHORT(data + glyph_data + 2); // originOffsetY (bottom edge)
+
+   if (stbtt_tag4(data + glyph_data + 4, 'p','n','g',' ')) {
+      g->image_offset = glyph_data + 8;
+      g->image_length = off1 - off0 - 8;
+      if (g->image_length < 0 || (stbtt_int64) g->image_offset + g->image_length > sbix_end)
+         return 0;
+      g->image_format = 17; // treat like CBDT PNG data
+      g->bit_depth    = 32;
+      stbtt__png_dimensions(data + g->image_offset, g->image_length, &g->width, &g->height);
+      g->yoff += g->height; // convert bottom-edge offset to top-edge offset
+      return 1;
+   }
+   if (stbtt_tag4(data + glyph_data + 4, 'd','u','p','e') && off1 - off0 >= 10) {
+      // alias for another glyph
+      int dupe = ttUSHORT(data + glyph_data + 8);
+      if (dupe >= info->numGlyphs)
+         return 0;
+      return stbtt__find_sbix_png(info, dupe, scale_y, g, depth + 1);
+   }
+   return 0;
+}
+
 static int stbtt__GetGlyfOffset(const stbtt_fontinfo *info, int glyph_index)
 {
    int g1,g2;
@@ -1654,6 +2278,7 @@ static int stbtt__GetGlyfOffset(const stbtt_fontinfo *info, int glyph_index)
 
    if (glyph_index >= info->numGlyphs) return -1; // glyph index out of range
    if (info->indexToLocFormat >= 2)    return -1; // unknown index->glyph map format
+   if (!info->glyf || !info->loca)     return -1; // bitmap-only font, no outline data
 
    if (info->indexToLocFormat == 0) {
       g1 = info->glyf + ttUSHORT(info->data + info->loca + glyph_index * 2) * 2;
@@ -1664,6 +2289,167 @@ static int stbtt__GetGlyfOffset(const stbtt_fontinfo *info, int glyph_index)
    }
 
    return g1==g2 ? -1 : g1; // if length is 0, return -1
+}
+
+// does the glyph have outline data? (embedded bitmaps are only used
+// for glyphs that don't)
+static int stbtt__glyph_has_outline(const stbtt_fontinfo *info, int glyph)
+{
+   if (info->cff.size)
+      return 1; // CFF fonts always render from outlines
+   if (!info->glyf)
+      return 0;
+   {
+      int g = stbtt__GetGlyfOffset(info, glyph);
+      if (g < 0)
+         return 0;
+      return ttSHORT(info->data + g) != 0; // numberOfContours
+   }
+}
+
+// should this glyph be rendered from an embedded bitmap (at this scale)?
+static int stbtt__use_sbit(const stbtt_fontinfo *info, int glyph, float scale_y, stbtt__sbit_glyph *sbit)
+{
+   if (stbtt__glyph_has_outline(info, glyph))
+      return 0;
+   if (!stbtt__find_glyph_sbit(info, glyph, scale_y, sbit))
+      return 0;
+   if (stbtt__sbit_is_png(info, sbit))
+      return 0; // PNG data can't be decoded into coverage values here
+   return 1;
+}
+
+STBTT_DEF unsigned char *stbtt_GetGlyphBitmapColor(const stbtt_fontinfo *info, float scale_x, float scale_y, int glyph, int *width, int *height, int *xoff, int *yoff)
+{
+   stbtt__sbit_glyph sbit;
+
+   if (scale_x == 0) scale_x = scale_y;
+   if (scale_y == 0) scale_y = scale_x;
+   if (scale_x == 0) return NULL;
+
+   if (stbtt__find_glyph_sbit_color(info, glyph, scale_y, &sbit) && !stbtt__sbit_is_png(info, &sbit)) {
+      int w = sbit.width, h = sbit.height;
+      int i, n;
+      stbtt_int64 n64;
+      unsigned char *rgba;
+      if (w <= 0 || h <= 0)
+         return NULL;
+      n64 = (stbtt_int64) w * h;
+      if (n64 > 0x3fffffff)
+         return NULL; // implausibly large bitmap
+      n = (int) n64;
+      rgba = (unsigned char *) STBTT_malloc((size_t) n * 4, info->userdata);
+      if (rgba == NULL)
+         return NULL;
+      if (sbit.image_format == 17 || sbit.image_format == 18 || sbit.image_format == 19) {
+         // raw 32-bit BGRA (premultiplied) -> RGBA; require the full
+         // w*h*4 payload to be present in the table block
+         const stbtt_uint8 *src = info->data + sbit.image_offset;
+         if ((stbtt_int64) n * 4 > sbit.image_length) {
+            STBTT_free(rgba, info->userdata);
+            return NULL;
+         }
+         for (i = 0; i < n; ++i) {
+            rgba[i*4+0] = src[i*4+2];
+            rgba[i*4+1] = src[i*4+1];
+            rgba[i*4+2] = src[i*4+0];
+            rgba[i*4+3] = src[i*4+3];
+         }
+      } else {
+         // grayscale embedded bitmap: decode coverage, expand to white RGBA
+         unsigned char *mono = (unsigned char *) STBTT_malloc((size_t) n, info->userdata);
+         if (mono == NULL) {
+            STBTT_free(rgba, info->userdata);
+            return NULL;
+         }
+         stbtt__decode_sbit(info, &sbit, mono, w, h, w, 0, 0);
+         for (i = 0; i < n; ++i) {
+            rgba[i*4+0] = 255;
+            rgba[i*4+1] = 255;
+            rgba[i*4+2] = 255;
+            rgba[i*4+3] = mono[i];
+         }
+         STBTT_free(mono, info->userdata);
+      }
+      if (width ) *width  = w;
+      if (height) *height = h;
+      if (xoff  ) *xoff   = sbit.xoff;
+      if (yoff  ) *yoff   = -sbit.yoff;
+      return rgba;
+   }
+
+   // no decodable embedded color bitmap: render monochrome (embedded
+   // grayscale bitmap or outline) and expand to white RGBA
+   {
+      int w = 0, h = 0, ix0 = 0, iy0 = 0, i, n;
+      unsigned char *mono, *rgba;
+      mono = stbtt_GetGlyphBitmap(info, scale_x, scale_y, glyph, &w, &h, &ix0, &iy0);
+      if (mono == NULL) {
+         if (width ) *width  = 0;
+         if (height) *height = 0;
+         if (xoff  ) *xoff   = 0;
+         if (yoff  ) *yoff   = 0;
+         return NULL;
+      }
+      n = w * h;
+      rgba = (unsigned char *) STBTT_malloc(n * 4, info->userdata);
+      if (rgba == NULL) {
+         STBTT_free(mono, info->userdata);
+         return NULL;
+      }
+      for (i = 0; i < n; ++i) {
+         rgba[i*4+0] = 255;
+         rgba[i*4+1] = 255;
+         rgba[i*4+2] = 255;
+         rgba[i*4+3] = mono[i];
+      }
+      STBTT_free(mono, info->userdata);
+      if (width ) *width  = w;
+      if (height) *height = h;
+      if (xoff  ) *xoff   = ix0;
+      if (yoff  ) *yoff   = iy0;
+      return rgba;
+   }
+}
+
+STBTT_DEF unsigned char *stbtt_GetCodepointBitmapColor(const stbtt_fontinfo *info, float scale_x, float scale_y, int codepoint, int *width, int *height, int *xoff, int *yoff)
+{
+   return stbtt_GetGlyphBitmapColor(info, scale_x, scale_y, stbtt_FindGlyphIndex(info, codepoint), width, height, xoff, yoff);
+}
+
+STBTT_DEF const unsigned char *stbtt_GetGlyphBitmapPNG(const stbtt_fontinfo *info, float scale_x, float scale_y, int glyph, int *data_len, int *width, int *height, int *xoff, int *yoff)
+{
+   stbtt__sbit_glyph sbit;
+
+   if (scale_x == 0) scale_x = scale_y;
+   if (scale_y == 0) scale_y = scale_x;
+
+   // PNG data embedded in CBDT (or, rarely, EBDT)
+   if (stbtt__find_glyph_sbit_color(info, glyph, scale_y, &sbit) && stbtt__sbit_is_png(info, &sbit)) {
+      if (data_len) *data_len = sbit.image_length;
+      if (width   ) *width    = sbit.width;
+      if (height  ) *height   = sbit.height;
+      if (xoff    ) *xoff     = sbit.xoff;
+      if (yoff    ) *yoff     = -sbit.yoff;
+      return info->data + sbit.image_offset;
+   }
+
+   // PNG data embedded in an sbix strike
+   if (stbtt__find_sbix_png(info, glyph, scale_y, &sbit, 0)) {
+      if (data_len) *data_len = sbit.image_length;
+      if (width   ) *width    = sbit.width;
+      if (height  ) *height   = sbit.height;
+      if (xoff    ) *xoff     = sbit.xoff;
+      if (yoff    ) *yoff     = -sbit.yoff;
+      return info->data + sbit.image_offset;
+   }
+
+   return NULL;
+}
+
+STBTT_DEF const unsigned char *stbtt_GetCodepointBitmapPNG(const stbtt_fontinfo *info, float scale_x, float scale_y, int codepoint, int *data_len, int *width, int *height, int *xoff, int *yoff)
+{
+   return stbtt_GetGlyphBitmapPNG(info, scale_x, scale_y, stbtt_FindGlyphIndex(info, codepoint), data_len, width, height, xoff, yoff);
 }
 
 static int stbtt__GetGlyphInfoT2(const stbtt_fontinfo *info, int glyph_index, int *x0, int *y0, int *x1, int *y1);
@@ -1696,9 +2482,18 @@ STBTT_DEF int stbtt_IsGlyphEmpty(const stbtt_fontinfo *info, int glyph_index)
    if (info->cff.size)
       return stbtt__GetGlyphInfoT2(info, glyph_index, NULL, NULL, NULL, NULL) == 0;
    g = stbtt__GetGlyfOffset(info, glyph_index);
-   if (g < 0) return 1;
-   numberOfContours = ttSHORT(info->data + g);
-   return numberOfContours == 0;
+   if (g >= 0) {
+      numberOfContours = ttSHORT(info->data + g);
+      if (numberOfContours != 0)
+         return 0;
+   }
+   // the glyph has no outline, but it may still have an embedded bitmap
+   {
+      stbtt__sbit_glyph sbit;
+      if (stbtt__find_glyph_sbit(info, glyph_index, 0.0f, &sbit))
+         return 0;
+   }
+   return 1;
 }
 
 static int stbtt__close_shape(stbtt_vertex *vertices, int num_vertices, int was_off, int start_off,
@@ -2834,7 +3629,18 @@ STBTT_DEF int stbtt_GetCodepointSVG(const stbtt_fontinfo *info, int unicode_code
 STBTT_DEF void stbtt_GetGlyphBitmapBoxSubpixel(const stbtt_fontinfo *font, int glyph, float scale_x, float scale_y,float shift_x, float shift_y, int *ix0, int *iy0, int *ix1, int *iy1)
 {
    int x0=0,y0=0,x1,y1; // =0 suppresses compiler warning
-   if (!stbtt_GetGlyphBox(font, glyph, &x0,&y0,&x1,&y1)) {
+   stbtt__sbit_glyph sbit;
+
+   if (stbtt__use_sbit(font, glyph, scale_y != 0 ? scale_y : scale_x, &sbit)) {
+      // embedded bitmaps have a fixed pixel size; the scale only
+      // selects which strike (size) to use
+      int sx = STBTT_ifloor(shift_x);
+      int sy = STBTT_ifloor(shift_y);
+      if (ix0) *ix0 = sbit.xoff + sx;
+      if (iy0) *iy0 = -sbit.yoff + sy;
+      if (ix1) *ix1 = sbit.xoff + sbit.width + sx;
+      if (iy1) *iy1 = -sbit.yoff + sbit.height + sy;
+   } else if (!stbtt_GetGlyphBox(font, glyph, &x0,&y0,&x1,&y1)) {
       // e.g. space character
       if (ix0) *ix0 = 0;
       if (iy0) *iy0 = 0;
@@ -3830,12 +4636,12 @@ STBTT_DEF unsigned char *stbtt_GetGlyphBitmapSubpixel(const stbtt_fontinfo *info
    int ix0,iy0,ix1,iy1;
    stbtt__bitmap gbm;
    stbtt_vertex *vertices;
-   int num_verts = stbtt_GetGlyphShape(info, glyph, &vertices);
+   int num_verts;
+   stbtt__sbit_glyph sbit;
 
    if (scale_x == 0) scale_x = scale_y;
    if (scale_y == 0) {
       if (scale_x == 0) {
-         STBTT_free(vertices, info->userdata);
          return NULL;
       }
       scale_y = scale_x;
@@ -3857,11 +4663,16 @@ STBTT_DEF unsigned char *stbtt_GetGlyphBitmapSubpixel(const stbtt_fontinfo *info
       gbm.pixels = (unsigned char *) STBTT_malloc(gbm.w * gbm.h, info->userdata);
       if (gbm.pixels) {
          gbm.stride = gbm.w;
-
-         stbtt_Rasterize(&gbm, 0.35f, vertices, num_verts, scale_x, scale_y, shift_x, shift_y, ix0, iy0, 1, info->userdata);
+         if (stbtt__use_sbit(info, glyph, scale_y, &sbit)) {
+            // render the glyph's embedded bitmap
+            stbtt__decode_sbit(info, &sbit, gbm.pixels, gbm.w, gbm.h, gbm.stride, sbit.xoff - ix0, -sbit.yoff - iy0);
+         } else {
+            num_verts = stbtt_GetGlyphShape(info, glyph, &vertices);
+            stbtt_Rasterize(&gbm, 0.35f, vertices, num_verts, scale_x, scale_y, shift_x, shift_y, ix0, iy0, 1, info->userdata);
+            STBTT_free(vertices, info->userdata);
+         }
       }
    }
-   STBTT_free(vertices, info->userdata);
    return gbm.pixels;
 }
 
@@ -3874,8 +4685,20 @@ STBTT_DEF void stbtt_MakeGlyphBitmapSubpixel(const stbtt_fontinfo *info, unsigne
 {
    int ix0,iy0;
    stbtt_vertex *vertices;
-   int num_verts = stbtt_GetGlyphShape(info, glyph, &vertices);
+   int num_verts;
    stbtt__bitmap gbm;
+   stbtt__sbit_glyph sbit;
+
+   if (stbtt__use_sbit(info, glyph, scale_y != 0 ? scale_y : scale_x, &sbit)) {
+      // render the glyph's embedded bitmap
+      if (out_w && out_h) {
+         stbtt_GetGlyphBitmapBoxSubpixel(info, glyph, scale_x, scale_y, shift_x, shift_y, &ix0,&iy0,0,0);
+         stbtt__decode_sbit(info, &sbit, output, out_w, out_h, out_stride, sbit.xoff - ix0, -sbit.yoff - iy0);
+      }
+      return;
+   }
+
+   num_verts = stbtt_GetGlyphShape(info, glyph, &vertices);
 
    stbtt_GetGlyphBitmapBoxSubpixel(info, glyph, scale_x, scale_y, shift_x, shift_y, &ix0,&iy0,0,0);
    gbm.pixels = output;
