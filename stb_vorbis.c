@@ -1,4 +1,4 @@
-// Ogg Vorbis audio decoder - v1.25 - public domain
+// Ogg Vorbis audio decoder - v1.26 - public domain
 // http://nothings.org/stb_vorbis/
 //
 // Original version written by Sean Barrett in 2007.
@@ -38,6 +38,7 @@
 //    Alice Rowan
 //
 // Partial history:
+//    1.26    - 2026-11-20 - sample-exact seeking in pushdata mode
 //    1.25    - 2026-11-19 - bugfixes
 //    1.24    - 2026-11-12 - fixes
 //    1.23    - 2026-11-08 - many fixes, support for 64-bit seek/offsets
@@ -273,6 +274,41 @@ extern void stb_vorbis_flush_pushdata(stb_vorbis *f);
 // call stb_vorbis_flush_pushdata(), then start calling decoding, then once
 // decoding is returning you data, call stb_vorbis_get_sample_offset, and
 // if you don't like the result, seek your file again and repeat.
+//
+// (the manual resync above still works, but stb_vorbis_seek_pushdata()
+// below provides sample-exact seeking without it: it returns the absolute
+// byte offset in the stream to reposition to, and the decoder resyncs and
+// aligns itself as you feed data from that offset.)
+
+extern stb_vorbis_int64 stb_vorbis_seek_pushdata(stb_vorbis *f, stb_vorbis_int64 sample_number);
+// sample-exact seek for pushdata mode. as the stream is fed in, stb_vorbis
+// indexes every Ogg page (see STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX), so any
+// sample that has already been fed can be located.
+//
+// on success, returns the absolute byte offset of an Ogg page at or before
+// 'sample_number', and arms the decoder: you must reposition your stream to
+// that offset and resume calling stb_vorbis_decode_frame_pushdata() with
+// data starting there. the first frames are used for resynchronization and
+// may return 0 samples; once decoding resumes, the output is sample-exact,
+// i.e. identical to what the pulldata API would produce at that position.
+// forward and backward seeks are equivalent, and repeated seeks are stable.
+//
+// returns -1 and sets an error if the sample cannot be reached (e.g. it has
+// not been fed yet, the index is disabled/empty, or the API mode is wrong).
+
+extern stb_vorbis_int64 stb_vorbis_get_pushdata_byte_offset(stb_vorbis *f);
+// returns the absolute byte offset of the data that the next call to
+// stb_vorbis_decode_frame_pushdata() should start with, i.e. how many
+// stream bytes have been consumed so far while sequential decoding. after
+// stb_vorbis_flush_pushdata() the relationship between the fed data and the
+// stream position is unknown, so this returns -1 until a flush that
+// specifies the offset or a resync establishes the position again.
+
+extern void stb_vorbis_flush_pushdata_at(stb_vorbis *f, stb_vorbis_int64 byte_offset);
+// like stb_vorbis_flush_pushdata(), but tells stb_vorbis that the next
+// datablock will start at absolute stream offset 'byte_offset'. the seek
+// index (and thus stb_vorbis_seek_pushdata()) stays valid; byte-offset
+// tracking continues from 'byte_offset' without waiting for a resync.
 #endif
 
 
@@ -511,6 +547,17 @@ enum STBVorbisError
 //     missing a ton of real ones in the interim; so minimum of 2
 #ifndef STB_VORBIS_PUSHDATA_CRC_COUNT
 #define STB_VORBIS_PUSHDATA_CRC_COUNT  4
+#endif
+
+// STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX [number]
+//     in pushdata mode, stb_vorbis records a bounded index of Ogg pages
+//     (byte offset + granule position) as the stream is fed in, so that
+//     stb_vorbis_seek_pushdata() can locate any already-seen sample. the
+//     index never grows past this many entries; once full, entries are
+//     thinned so memory use has a hard ceiling. a value of 0 disables
+//     pushdata seeking (but not normal sequential decoding).
+#ifndef STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX
+#define STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX  4096
 #endif
 
 // STB_VORBIS_FAST_HUFFMAN_LENGTH [number]
@@ -780,6 +827,15 @@ typedef struct
    int64 last_decoded_sample;
 } ProbedPage;
 
+#ifndef STB_VORBIS_NO_PUSHDATA_API
+typedef struct
+{
+   int64 byte_offset;     // absolute stream offset of the Ogg page capture pattern
+   int64 sample_start;    // conservative first sample decodable from this page
+   int64 granule_position;// page's absolute granule position (last completed sample+1)
+} PushSeekEntry;
+#endif
+
 struct stb_vorbis
 {
   // user-accessible info
@@ -896,6 +952,20 @@ struct stb_vorbis
    int page_crc_tests; // only in push_mode: number of tests active; -1 if not searching
 #ifndef STB_VORBIS_NO_PUSHDATA_API
    CRCscan scan[STB_VORBIS_PUSHDATA_CRC_COUNT];
+
+  // push mode byte-offset tracking and sample-exact seeking
+   uint8 *push_block;       // first byte of the datablock passed to the current decode call
+   int64  push_block_offset;// absolute stream offset of push_block, -1 if unknown
+   int64  push_byte_offset; // absolute stream offset of the next byte to consume; -1 if unknown
+
+  // bounded index of Ogg pages seen while feeding the stream
+   PushSeekEntry *seek_index;
+   int seek_index_count;
+   int seek_index_cap;
+
+  // armed by stb_vorbis_seek_pushdata(): resync, then align output to target
+   int    push_seek_active;
+   int64  push_seek_target;
 #endif
 
   // sample-access
@@ -1486,6 +1556,10 @@ static int capture_pattern(vorb *f)
 #define PAGEFLAG_first_page         2
 #define PAGEFLAG_last_page          4
 
+#ifndef STB_VORBIS_NO_PUSHDATA_API
+static void pushdata_note_page(vorb *f, uint64 loc);
+#endif
+
 static int start_page_no_capturepattern(vorb *f)
 {
    uint64 loc,n;
@@ -1540,6 +1614,12 @@ static int start_page_no_capturepattern(vorb *f)
       f->p_first.page_end = f->p_first.page_start + len;
       f->p_first.last_decoded_sample = loc;
    }
+   #ifndef STB_VORBIS_NO_PUSHDATA_API
+   if (IS_PUSH_MODE(f)) {
+      // f->stream has advanced past the 27-byte header and the segment table
+      pushdata_note_page(f, loc);
+   }
+   #endif
    f->next_seg = 0;
    return TRUE;
 }
@@ -4360,6 +4440,12 @@ static void vorbis_deinit(stb_vorbis *p)
       setup_temp_free(p, &p->temp_values, 0);
       setup_temp_free(p, &p->temp_mults, 0);
    }
+   #ifndef STB_VORBIS_NO_PUSHDATA_API
+   if (!p->alloc.alloc_buffer && p->seek_index != NULL) {
+      free(p->seek_index);
+      p->seek_index = NULL;
+   }
+   #endif
    #ifndef STB_VORBIS_NO_STDIO
    if (p->close_on_free) fclose(p->f);
    #endif
@@ -4461,6 +4547,68 @@ static stb_vorbis * vorbis_alloc(stb_vorbis *f)
 
 #ifndef STB_VORBIS_NO_PUSHDATA_API
 
+// record an Ogg page in the bounded seek index. 'loc' is its absolute
+// granule position; pages with an unknown position (~0) are not indexed.
+static void pushdata_note_page(vorb *f, uint64 loc)
+{
+   int64 page_start;
+   PushSeekEntry *grown;
+
+   if (STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX <= 0)
+      return;
+   // only index when the absolute stream position is known
+   if (f->push_block == NULL || f->push_block_offset < 0)
+      return;
+   // same sanity limit start_page_no_capturepattern() enforces on granule pos
+   if (loc == ~(uint64)0 || loc >= ((uint64)1 << 50))
+      return;
+
+   // f->stream has advanced past the 27-byte header and the segment table;
+   // push_block_offset is the absolute position of the current datablock.
+   page_start = f->push_block_offset + (f->stream - f->push_block)
+                - (27 + f->segment_count);
+
+   // the same page is parsed once, but guard anyway against duplicate entries
+   if (f->seek_index_count > 0 &&
+       f->seek_index[f->seek_index_count-1].byte_offset == page_start)
+      return;
+
+   if (f->seek_index_count >= f->seek_index_cap) {
+      int new_cap;
+      if (f->alloc.alloc_buffer)
+         return; // fixed-buffer allocation: degrade gracefully, keep index
+      new_cap = f->seek_index_cap ? f->seek_index_cap * 2 : 32;
+      grown = (PushSeekEntry *) realloc(f->seek_index,
+                                        (size_t)new_cap * sizeof(*grown));
+      if (grown == NULL) return; // out of memory: seeking stays best-effort
+      f->seek_index = grown;
+      f->seek_index_cap = new_cap;
+   }
+
+   if (f->seek_index_count >= STB_VORBIS_PUSHDATA_SEEK_INDEX_MAX) {
+      // hard ceiling: thin out every other entry to make room, then keep
+      // filling the freed half. memory use can never exceed the bound.
+      int w = 1, r;
+      for (r = 2; r < f->seek_index_count; r += 2)
+         f->seek_index[w++] = f->seek_index[r];
+      f->seek_index_count = w;
+   }
+
+   {
+      // the granule position is the end of the last packet completing on
+      // this page; decoding starting at this page can only reach it after
+      // one (long) block's overlap. use the same conservative margin as the
+      // pulldata seek so a page is never selected past the requested sample.
+      int64 margin = ((int64)(f->blocksize_1 - f->blocksize_0)) >> 2;
+      int64 sample_start = (int64) loc - margin;
+      if (sample_start < 0) sample_start = 0;
+      f->seek_index[f->seek_index_count].byte_offset      = page_start;
+      f->seek_index[f->seek_index_count].sample_start      = sample_start;
+      f->seek_index[f->seek_index_count].granule_position  = (int64) loc;
+   }
+   ++f->seek_index_count;
+}
+
 void stb_vorbis_flush_pushdata(stb_vorbis *f)
 {
    f->previous_length = 0;
@@ -4471,6 +4619,26 @@ void stb_vorbis_flush_pushdata(stb_vorbis *f)
    f->samples_output = 0;
    f->channel_buffer_start = 0;
    f->channel_buffer_end = 0;
+   // the data the caller feeds next is no longer known to be contiguous
+   f->push_block = NULL;
+   f->push_block_offset = -1;
+   f->push_byte_offset = -1;
+   f->push_seek_active = FALSE;
+}
+
+void stb_vorbis_flush_pushdata_at(stb_vorbis *f, stb_vorbis_int64 byte_offset)
+{
+   stb_vorbis_flush_pushdata(f);
+   // flush_pushdata() invalidated the offsets; re-establish them explicitly.
+   // the seek index itself is retained, so seeking keeps working.
+   f->push_block_offset = byte_offset;
+   f->push_byte_offset = byte_offset;
+}
+
+stb_vorbis_int64 stb_vorbis_get_pushdata_byte_offset(stb_vorbis *f)
+{
+   if (!IS_PUSH_MODE(f)) return -1;
+   return f->push_byte_offset;
 }
 
 static int vorbis_search_for_page_pushdata(vorb *f, uint8 *data, int data_len)
@@ -4574,12 +4742,34 @@ int stb_vorbis_decode_frame_pushdata(
 {
    int i;
    int len,right,left;
+   int used;
+   int64 frame_start = -1;
 
    if (!IS_PUSH_MODE(f)) return error(f, VORBIS_invalid_api_mixing);
 
+   // every datablock is referenced by its absolute stream position while
+   // the stream is contiguous; a flush (unknown position) keeps it at NULL
+   // until the position becomes known again (resync or flush_pushdata_at).
+   //
+   // push_byte_offset always points at the next byte to consume, so data[0]
+   // on this call is exactly that position; the block base for page-offset
+   // math therefore starts there, and the within-block skip starts at 0.
+   // this stays correct when the caller reuses the same buffer across
+   // calls (a ring/memmove feeder), since no state carries over between
+   // datablocks except the running absolute offset.
+   if (f->push_byte_offset >= 0) {
+      f->push_block = (uint8 *) data;
+      f->push_block_offset = f->push_byte_offset;
+   } else {
+      f->push_block = NULL;
+      f->push_block_offset = -1;
+   }
+
    if (f->page_crc_tests >= 0) {
       *samples = 0;
-      return vorbis_search_for_page_pushdata(f, (uint8 *) data, data_len);
+      used = vorbis_search_for_page_pushdata(f, (uint8 *) data, data_len);
+      if (f->push_byte_offset >= 0) f->push_byte_offset += used;
+      return used;
    }
 
    f->stream     = (uint8 *) data;
@@ -4592,6 +4782,9 @@ int stb_vorbis_decode_frame_pushdata(
       return 0;
    }
 
+   if (f->push_seek_active && f->current_loc_valid)
+      frame_start = f->current_loc;
+
    if (!vorbis_decode_packet(f, &len, &left, &right)) {
       // save the actual error we encountered
       enum STBVorbisError error = f->error;
@@ -4601,7 +4794,9 @@ int stb_vorbis_decode_frame_pushdata(
          while (get8_packet(f) != EOP)
             if (f->eof) break;
          *samples = 0;
-         return (int) (f->stream - data);
+         used = (int) (f->stream - data);
+         if (f->push_byte_offset >= 0) f->push_byte_offset += used;
+         return used;
       }
       if (error == VORBIS_continued_packet_flag_invalid) {
          if (f->previous_length == 0) {
@@ -4611,7 +4806,9 @@ int stb_vorbis_decode_frame_pushdata(
             while (get8_packet(f) != EOP)
                if (f->eof) break;
             *samples = 0;
-            return (int) (f->stream - data);
+            used = (int) (f->stream - data);
+            if (f->push_byte_offset >= 0) f->push_byte_offset += used;
+            return used;
          }
       }
       // if we get an error while parsing, what to do?
@@ -4628,10 +4825,58 @@ int stb_vorbis_decode_frame_pushdata(
    for (i=0; i < f->channels; ++i)
       f->outputs[i] = f->channel_buffers[i] + left;
 
+   used = (int) (f->stream - data);
+   if (f->push_byte_offset >= 0) f->push_byte_offset += used;
+
+   if (f->push_seek_active) {
+      // align the output to the requested sample, exactly like the pulldata
+      // seek path: frames ending before the target produce no output, and
+      // the frame containing the target has its leading samples skipped.
+      int64 start;
+      int skip;
+      if (len == 0) {
+         // warmup frame with no previous window: it carries no output
+         // samples (vorbis overlap discard), so it can never contain the
+         // target; just keep resyncing until a real output frame appears.
+         *samples = 0;
+         return used;
+      }
+      start = f->current_loc_valid ? f->current_loc - len : frame_start;
+      if (start < 0) {
+         // position not yet recoverable (e.g. granule-less pages); keep
+         // resyncing until current_loc becomes valid.
+         *samples = 0;
+         return used;
+      }
+      if (start + len <= f->push_seek_target) {
+         // whole frame is before the target, discard it
+         *samples = 0;
+         return used;
+      }
+      skip = (int) (f->push_seek_target - start);
+      if (skip < 0) skip = 0;
+      if (skip > len) {
+         // should be unreachable given the index granule guarantees
+         *samples = 0;
+         return used;
+      }
+      left += skip;
+      len  -= skip;
+      // the outputs[] pointers were set before the skip; re-point them at
+      // the aligned position so callers actually receive the target sample
+      for (i = 0; i < f->channels; ++i)
+         f->outputs[i] = f->channel_buffers[i] + left;
+      f->channel_buffer_start = left;
+      f->channel_buffer_end   = left + len;
+      f->current_playback_loc = f->push_seek_target;
+      f->current_playback_loc_valid = TRUE;
+      f->push_seek_active = FALSE;
+   }
+
    if (channels) *channels = f->channels;
    *samples = len;
    *output = f->outputs;
-   return (int) (f->stream - data);
+   return used;
 }
 
 stb_vorbis *stb_vorbis_open_pushdata(
@@ -4657,11 +4902,85 @@ stb_vorbis *stb_vorbis_open_pushdata(
       *f = p;
       *data_used = (int) (f->stream - data);
       *error = 0;
+      // push mode starts at absolute offset 0; the headers just consumed are
+      // accounted for so byte-offset tracking follows the fed stream exactly.
+      f->push_block = NULL;
+      f->push_block_offset = 0;
+      f->push_byte_offset = f->stream - (uint8 *) data;
+      f->push_seek_active = FALSE;
       return f;
    } else {
       vorbis_deinit(&p);
       return NULL;
    }
+}
+
+// sample-exact seek in pushdata mode. picks the indexed page whose granule
+// position is the last one not exceeding the target (so its first output
+// frame starts at or before the target), arms the decoder, and returns the
+// absolute byte offset the caller must reposition its stream to.
+stb_vorbis_int64 stb_vorbis_seek_pushdata(stb_vorbis *f, stb_vorbis_int64 sample_number)
+{
+   int lo, hi, best;
+   int64 result;
+
+   if (!IS_PUSH_MODE(f)) { error(f, VORBIS_invalid_api_mixing); return -1; }
+   if (sample_number < 0)  { error(f, VORBIS_seek_invalid); return -1; }
+   if (f->seek_index_count == 0) { error(f, VORBIS_seek_failed); return -1; }
+
+   // binary search: last page whose conservative start is still at or
+   // before the target. sample_start values are non-decreasing.
+   lo = 0; hi = f->seek_index_count;
+   while (lo < hi) {
+      int mid = lo + (hi - lo) / 2;
+      if (f->seek_index[mid].sample_start <= sample_number)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   if (lo == 0) {
+      // target precedes the earliest indexed page: clamp to the first one
+      best = 0;
+   } else {
+      best = lo - 1;
+   }
+
+   result = f->seek_index[best].byte_offset;
+
+   // targeting the very start of the stream needs the file-open semantics
+   // (discard the initial partial frame so the first output is sample 0).
+   // any later target keeps the previous-window warmup and is located from
+   // the page granule position, exactly like the pulldata seek resync.
+   f->first_decode = (best == 0 &&
+                      sample_number <= f->seek_index[0].sample_start);
+
+   // re-arm for resync. the index only ever stores verified page-start
+   // offsets, and the caller is told to reposition exactly there, so the
+   // next datablock is guaranteed to begin on a page boundary. parse the
+   // page directly instead of running the CRC resync scan: the scan can
+   // lock onto a page partway through the datablock and silently drop the
+   // leading audio packets, which would make sample-exact alignment
+   // impossible. (a plain flush_pushdata still uses the scan path.)
+   f->previous_length = 0;
+   f->discard_samples_deferred = 0;
+   f->current_loc_valid = FALSE;
+   f->page_crc_tests = -1;
+   f->samples_output = 0;
+   f->channel_buffer_start = 0;
+   f->channel_buffer_end = 0;
+   f->next_seg = -1;
+   f->valid_bits = 0;
+   f->packet_bytes = 0;
+   f->bytes_in_seg = 0;
+   f->eof = 0;
+
+   f->push_seek_active = TRUE;
+   f->push_seek_target = sample_number;
+   f->push_block = NULL;
+   f->push_block_offset = result;
+   f->push_byte_offset = result;
+
+   return result;
 }
 #endif // STB_VORBIS_NO_PUSHDATA_API
 
