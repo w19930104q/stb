@@ -1,4 +1,4 @@
-/* stb_image - v2.33 - public domain image loader - http://nothings.org/stb
+/* stb_image - v2.34 - public domain image loader - http://nothings.org/stb
                                   no warranty implied; use at your own risk
 
    == SECURITY NOTE ==
@@ -46,7 +46,7 @@
 
       GIF (*comp always reports as 4-channel)
       HDR (radiance rgbE format)
-      PNM (PPM and PGM binary only)
+      PNM (PPM, PGM and PAM binary only)
 
       Animated GIF still needs a proper API, but here's one way to do it:
           http://gist.github.com/urraka/685d9a6340b26b830d49
@@ -64,6 +64,7 @@ LICENSE
 
 RECENT REVISION HISTORY:
 
+      2.34  (2026-11-20) PNM: support PAM (P7) files
       2.33  (2026-11-19) bugfixes
       2.32  (2026-11-12) fix req_comp regression; other fixes
       2.31  (2026-11-08) many bugfixes and etc.
@@ -90,6 +91,7 @@ RECENT REVISION HISTORY:
     Ken Miller (pgm, ppm)                  Richard Mitton (16-bit PSD)
     github:urraka (animated gif)           Junggon Kim (PNM comments)
     Christopher Forseth (animated gif)     Daniel Gibson (16-bit TGA)
+                                           Wesley Griffin (PAM)
                                            socks-the-fox (16-bit PNG)
                                            Jeremy Sawicki (handle all ImageNet JPGs)
  Optimizations & bugfixes                  Mikhail Morozov (1-bit BMP)
@@ -364,7 +366,7 @@ RECENT REVISION HISTORY:
 //        STBI_NO_TGA
 //        STBI_NO_GIF
 //        STBI_NO_HDR
-//        STBI_NO_PNM   (.ppm and .pgm)
+//        STBI_NO_PNM   (.ppm, .pgm and .pam)
 //
 //  - You can request *only* certain decoders and suppress all other ones
 //    (this will be more forward-compatible, as addition of new decoders
@@ -377,7 +379,7 @@ RECENT REVISION HISTORY:
 //        STBI_ONLY_TGA
 //        STBI_ONLY_GIF
 //        STBI_ONLY_HDR
-//        STBI_ONLY_PNM   (.ppm and .pgm)
+//        STBI_ONLY_PNM   (.ppm, .pgm and .pam)
 //
 //  - Setting STBI_NO_LINEAR will remove the stbi_loadf family of functions
 //    that returns pixel data as floats.
@@ -7196,11 +7198,12 @@ static int stbi__psd_info(stbi__context *s, stbi_info_res *res)
 #endif
 
 // *************************************************************************************************
-// Portable Gray Map and Portable Pixel Map loader
+// Portable Gray Map, Portable Pixel Map and Portable Arbitrary Map loader
 // by Ken Miller
 //
 // PGM: http://netpbm.sourceforge.net/doc/pgm.html
 // PPM: http://netpbm.sourceforge.net/doc/ppm.html
+// PAM: http://netpbm.sourceforge.net/doc/pam.html
 
 #ifndef STBI_NO_PNM
 
@@ -7209,7 +7212,7 @@ static int      stbi__pnm_test(stbi__context *s)
    char p, t;
    p = (char) stbi__get8(s);
    t = (char) stbi__get8(s);
-   if (p != 'P' || (t != '2' && t != '3' && t != '5' && t != '6')) {
+   if (p != 'P' || (t != '2' && t != '3' && t != '5' && t != '6' && t != '7')) {
        stbi__rewind( s );
        return 0;
    }
@@ -7249,6 +7252,81 @@ static int stbi__pnm_getinteger(stbi__context *s, char *c)
    return value;
 }
 
+static void stbi__pnm_gettoken(stbi__context *s, char *c, char *token, int maxlen)
+{
+   int i = 0;
+
+   while (!stbi__at_eof(s) && !stbi__pnm_isspace(*c)) {
+      if (i < maxlen-1)
+         token[i++] = *c;
+      *c = (char) stbi__get8(s);
+   }
+   token[i] = '\0';
+}
+
+// PAM (P7) has a tagged, line-oriented header instead of the fixed PNM one;
+// the raster itself follows the same rules as binary PNM (maxval <= 255:
+// one byte per sample, otherwise two big-endian bytes per sample).
+static int stbi__pam_info_internal(stbi__context *s, int *x, int *y, int *comp, int *maxv)
+{
+   char c, token[16];
+
+   *x = *y = *comp = *maxv = 0;
+
+   c = (char) stbi__get8(s);
+   for (;;) {
+      stbi__pnm_skip_whitespace(s, &c); // also skips '#' comment lines
+
+      if (stbi__at_eof(s))
+         return stbi__err("bad PAM header", "PAM file ended before ENDHDR");
+
+      stbi__pnm_gettoken(s, &c, token, sizeof(token));
+
+      if (!strcmp(token, "ENDHDR")) {
+         // the single whitespace character terminating the header was
+         // consumed by stbi__pnm_gettoken; raster data follows immediately
+         break;
+      } else if (!strcmp(token, "WIDTH")) {
+         stbi__pnm_skip_whitespace(s, &c);
+         *x = stbi__pnm_getinteger(s, &c);
+         if (*x == 0)
+            return stbi__err("invalid width", "PAM image header had zero or overflowing width");
+      } else if (!strcmp(token, "HEIGHT")) {
+         stbi__pnm_skip_whitespace(s, &c);
+         *y = stbi__pnm_getinteger(s, &c);
+         if (*y == 0)
+            return stbi__err("invalid height", "PAM image header had zero or overflowing height");
+      } else if (!strcmp(token, "DEPTH")) {
+         stbi__pnm_skip_whitespace(s, &c);
+         *comp = stbi__pnm_getinteger(s, &c);
+         if (*comp < 1 || *comp > 4)
+            return stbi__err("invalid depth", "PAM image header had unsupported depth");
+      } else if (!strcmp(token, "MAXVAL")) {
+         stbi__pnm_skip_whitespace(s, &c);
+         *maxv = stbi__pnm_getinteger(s, &c);
+         if (*maxv == 0)
+            return stbi__err("invalid maxval", "PAM image header had zero maxval");
+      } else if (!strcmp(token, "TUPLTYPE")) {
+         // the tuple type is informational only; the channel count from
+         // DEPTH fully determines the pixel layout, so ignore the value
+         stbi__pnm_skip_whitespace(s, &c);
+         stbi__pnm_gettoken(s, &c, token, sizeof(token));
+      } else {
+         return stbi__err("unrecognized header token", "PAM image bad header");
+      }
+   }
+
+   if (*x == 0 || *y == 0 || *comp == 0 || *maxv == 0)
+      return stbi__err("bad PAM header", "PAM image header is missing required fields");
+
+   if (*maxv > 65535)
+      return stbi__err("max value > 65535", "PAM image supports only 8-bit and 16-bit images");
+   else if (*maxv > 255)
+      return 16;
+   else
+      return 8;
+}
+
 static int stbi__pnm_info_internal(stbi__context *s, int *x, int *y, int *comp, int *maxv, int *isascii)
 {
    int dummy;
@@ -7265,10 +7343,13 @@ static int stbi__pnm_info_internal(stbi__context *s, int *x, int *y, int *comp, 
    // Get identifier
    p = (char) stbi__get8(s);
    t = (char) stbi__get8(s);
-   if (p != 'P' || (t != '2' && t != '3' && t != '5' && t != '6')) {
+   if (p != 'P' || (t != '2' && t != '3' && t != '5' && t != '6' && t != '7')) {
        stbi__rewind(s);
        return 0;
    }
+
+   if (t == '7') // PAM uses a tagged header; raster is always binary
+      return stbi__pam_info_internal(s, x, y, comp, maxv);
 
    *comp = (t == '3' || t == '6') ? 3 : 1;  // '2'/'5' is 1-component .pgm; '3'/'6' is 3-component .ppm
    *isascii = t == '2' || t == '3';
