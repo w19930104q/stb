@@ -1,4 +1,4 @@
-/* stb_image - v2.33 - public domain image loader - http://nothings.org/stb
+/* stb_image - v2.34 - public domain image loader - http://nothings.org/stb
                                   no warranty implied; use at your own risk
 
    == SECURITY NOTE ==
@@ -41,7 +41,7 @@
       PNG 1/2/4/8/16-bit-per-channel
 
       TGA (not sure what subset, if a subset)
-      BMP non-1bpp, non-RLE
+      BMP non-1bpp, RLE8/RLE4-compressed supported
       PSD (composited view only, no extra channels, 8/16 bit-per-channel)
 
       GIF (*comp always reports as 4-channel)
@@ -64,6 +64,7 @@ LICENSE
 
 RECENT REVISION HISTORY:
 
+      2.34  (2026-11-20) support RLE-compressed BMPs (BI_RLE8 and BI_RLE4)
       2.33  (2026-11-19) bugfixes
       2.32  (2026-11-12) fix req_comp regression; other fixes
       2.31  (2026-11-08) many bugfixes and etc.
@@ -5479,6 +5480,7 @@ typedef struct
    int bpp, offset, hsz;
    unsigned int mr,mg,mb,ma, all_a;
    int extra_read;
+   int compress;
 } stbi__bmp_data;
 
 static int stbi__bmp_set_mask_defaults(stbi__bmp_data *info, int compress)
@@ -5519,6 +5521,7 @@ static void *stbi__bmp_parse_header(stbi__context *s, stbi__bmp_data *info)
    info->hsz = hsz = stbi__get32le(s);
    info->mr = info->mg = info->mb = info->ma = 0;
    info->extra_read = 14;
+   info->compress = 0;
 
    if (info->offset < 0) return stbi__errpuc("bad BMP", "bad BMP");
 
@@ -5534,7 +5537,9 @@ static void *stbi__bmp_parse_header(stbi__context *s, stbi__bmp_data *info)
    info->bpp = stbi__get16le(s);
    if (hsz != 12) {
       int compress = stbi__get32le(s);
-      if (compress == 1 || compress == 2) return stbi__errpuc("BMP RLE", "BMP type not supported: RLE");
+      info->compress = compress;
+      if (compress == 1 && info->bpp != 8) return stbi__errpuc("bad BMP", "BMP type not supported: RLE8 requires 8 bits/pixel");
+      if (compress == 2 && info->bpp != 4) return stbi__errpuc("bad BMP", "BMP type not supported: RLE4 requires 4 bits/pixel");
       if (compress >= 4) return stbi__errpuc("BMP JPEG/PNG", "BMP type not supported: unsupported compression"); // this includes PNG/JPEG modes
       if (compress == 3 && info->bpp != 16 && info->bpp != 32) return stbi__errpuc("bad BMP", "bad BMP"); // bitfields requires 16 or 32 bits/pixel
       stbi__get32le(s); // discard sizeof
@@ -5586,6 +5591,109 @@ static void *stbi__bmp_parse_header(stbi__context *s, stbi__bmp_data *info)
    return (void *) 1;
 }
 
+// own EOF check so the BMP decoder doesn't rely on stbi__at_eof, which
+// isn't compiled in when JPEG, HDR and PNM support are all disabled
+static int stbi__bmp_rle_eof(stbi__context *s)
+{
+   if (s->io.read) {
+      if (!(s->io.eof)(s->io_user_data)) return 0;
+      // if feof() is true, check if buffer = end
+      // special case: we've only got the special 0 character at the end
+      if (s->read_from_callbacks == 0) return 1;
+   }
+   return s->img_buffer >= s->img_buffer_end;
+}
+
+// write one palette-indexed pixel at (x,y) in file-order scanlines;
+// rejects coordinates outside the bitmap so corrupt streams can't
+// write out of bounds
+static int stbi__bmp_rle_put(stbi_uc *out, int target, stbi_uc pal[256][4], int img_x, int img_y, int x, int y, int v)
+{
+   int z;
+   if (x < 0 || x >= img_x || y < 0 || y >= img_y)
+      return 0;
+   z = (y * img_x + x) * target;
+   out[z+0] = pal[v][0];
+   out[z+1] = pal[v][1];
+   out[z+2] = pal[v][2];
+   if (target == 4)
+      out[z+3] = 255;
+   return 1;
+}
+
+// decode a BI_RLE8 (is_rle4 == 0) or BI_RLE4 (is_rle4 != 0) command stream.
+// (x,y) is the cursor in file-order scanlines; the image is vertically
+// flipped afterwards if the file is bottom-up, so both orientations and
+// top-down files decode through the same path.
+static int stbi__bmp_decode_rle(stbi__context *s, stbi_uc *out, int target, stbi_uc pal[256][4], int img_x, int img_y, int is_rle4)
+{
+   int x = 0, y = 0, i;
+
+   for (;;) {
+      int count, value;
+      if (y >= img_y)
+         return 1; // every scanline is complete; tolerate a missing end-of-bitmap marker
+      if (stbi__bmp_rle_eof(s))
+         return 0; // command stream is truncated
+      count = stbi__get8(s);
+      value = stbi__get8(s);
+      if (count > 0) {
+         // encoded run: 'count' pixels; RLE4 alternates between the high
+         // and low nibble of 'value', starting with the high nibble
+         for (i = 0; i < count; ++i) {
+            int v = is_rle4 ? ((i & 1) ? (value & 15) : (value >> 4)) : value;
+            if (!stbi__bmp_rle_put(out, target, pal, img_x, img_y, x, y, v))
+               return 0;
+            ++x;
+         }
+      } else if (value == 0) {
+         // end of line: move to the start of the next scanline
+         x = 0;
+         ++y;
+      } else if (value == 1) {
+         // end of bitmap
+         return 1;
+      } else if (value == 2) {
+         // delta: jump right and up (towards later scanlines) by the
+         // given amounts, possibly across several rows; the cursor may
+         // not leave the bitmap (it may sit one row past the end)
+         x += stbi__get8(s);
+         y += stbi__get8(s);
+         if (x > img_x || y > img_y)
+            return 0;
+      } else {
+         // absolute mode: 'value' literal pixels follow, packed two
+         // pixels per byte for RLE4; the pixel data is padded to a
+         // 16-bit boundary
+         int n = value;
+         int pending = 0;
+         for (i = 0; i < n; ++i) {
+            int v;
+            if (is_rle4) {
+               if (i & 1) {
+                  v = pending & 15;
+               } else {
+                  pending = stbi__get8(s);
+                  v = pending >> 4;
+               }
+            } else {
+               v = stbi__get8(s);
+            }
+            if (!stbi__bmp_rle_put(out, target, pal, img_x, img_y, x, y, v))
+               return 0;
+            ++x;
+         }
+         if (is_rle4) {
+            if (((n + 1) >> 1) & 1)
+               stbi__get8(s); // word-alignment pad
+         } else {
+            if (n & 1)
+               stbi__get8(s); // word-alignment pad
+         }
+      }
+   }
+}
+
 
 static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri)
 {
@@ -5602,8 +5710,10 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
    if (stbi__bmp_parse_header(s, &info) == NULL)
       return NULL; // error code already set
 
-   if (s->img_y > STBI_MAX_DIMENSIONS || s->img_y < -STBI_MAX_DIMENSIONS || !s->img_y ||
-       s->img_x > STBI_MAX_DIMENSIONS || s->img_x <= 0) {
+   // img_x/img_y are unsigned in the context, so cast to int before
+   // comparing against the (possibly negative) limits
+   if ((int) s->img_y > STBI_MAX_DIMENSIONS || (int) s->img_y < -STBI_MAX_DIMENSIONS || !s->img_y ||
+       (int) s->img_x > STBI_MAX_DIMENSIONS || (int) s->img_x <= 0) {
        return stbi__errpuc("bad size","Invalid image dimensions (corrupt?)");
    }
 
@@ -5678,7 +5788,23 @@ static void *stbi__bmp_load(stbi__context *s, int *x, int *y, int *comp, int req
       else if (info.bpp == 8) width = s->img_x;
       else { STBI_FREE(out); return stbi__errpuc("bad bpp", "Corrupt BMP"); }
       pad = (-width)&3;
-      if (info.bpp == 1) {
+      if (info.compress == 1 || info.compress == 2) {
+         // RLE-compressed 8-bit (BI_RLE8) or 4-bit (BI_RLE4) bitmap;
+         // pre-fill with palette entry 0, since the command stream may
+         // leave pixels untouched (delta jumps, short rows) and those
+         // decode as index 0
+         for (i = 0; i < (int) (s->img_x * s->img_y); ++i) {
+            out[i*target+0] = pal[0][0];
+            out[i*target+1] = pal[0][1];
+            out[i*target+2] = pal[0][2];
+            if (target == 4)
+               out[i*target+3] = 255;
+         }
+         if (!stbi__bmp_decode_rle(s, out, target, pal, s->img_x, s->img_y, info.compress == 2)) {
+            STBI_FREE(out);
+            return stbi__errpuc("corrupt", "Corrupt BMP: bad RLE data");
+         }
+      } else if (info.bpp == 1) {
          for (j=0; j < (int) s->img_y; ++j) {
             int bit_offset = 7, v = stbi__get8(s);
             for (i=0; i < (int) s->img_x; ++i) {
@@ -7149,6 +7275,8 @@ static int stbi__bmp_info(stbi__context *s, stbi_info_res *res)
    res->type = STBI_type_bmp;
    res->x = s->img_x;
    res->y = s->img_y;
+   if (res->y < 0) // top-down bitmaps store a negative height
+      res->y = -res->y;
    if (info.bpp == 24 && info.ma == 0xff000000)
       res->comp = 3;
    else

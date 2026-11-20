@@ -1,3 +1,12 @@
+2026-11-20
+
+---- stb_image.h
+
+- support RLE-compressed BMPs (BI_RLE8 and BI_RLE4)
+- fix BMP dimension check rejecting valid images (signed/unsigned comparison)
+
+====================================================================================
+
 2026-11-19
 
 ---- stb_image.h
