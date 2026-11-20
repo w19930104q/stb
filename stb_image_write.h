@@ -1,4 +1,4 @@
-/* stb_image_write - v1.18 - public domain - http://nothings.org/stb
+/* stb_image_write - v1.19 - public domain - http://nothings.org/stb
    writes out PNG/BMP/TGA/JPEG/HDR images to C stdio - Sean Barrett 2010-2015
                                      no warranty implied; use at your own risk
 
@@ -45,6 +45,7 @@ USAGE:
    There are five functions, one for each image file format:
 
      int stbi_write_png(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes);
+     int stbi_write_png16(char const *filename, int w, int h, int comp, const void *data, ptrdiff_t stride_in_bytes);
      int stbi_write_bmp(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_tga(char const *filename, int w, int h, int comp, const void *data);
      int stbi_write_jpg(char const *filename, int w, int h, int comp, const void *data, int quality);
@@ -64,6 +65,7 @@ USAGE:
    expected to open/close your file-equivalent before and after calling these:
 
      int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+     int stbi_write_png16_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
      int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
      int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
      int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data, ptrdiff_t stride_in_bytes);
@@ -117,6 +119,13 @@ USAGE:
 
    PNG allows you to set the deflate compression level by setting the global
    variable 'stbi_write_png_compression_level' (it defaults to 8).
+
+   PNG can be written with 16-bits per channel using stbi_write_png16 (or
+   stbi_write_png16_to_func). These take the same arguments as the 8-bit
+   functions, but 'data' must point to an array of 16-bit unsigned samples
+   (in the platform's native byte order); 'stride_in_bytes' is still
+   measured in bytes. The PNG file stores the samples big-endian as the
+   format requires.
 
    HDR expects linear float data. Since the format is always 32-bit rgb(e)
    data, alpha (if provided) is discarded, and for monochrome data it is
@@ -196,6 +205,7 @@ STBIWDEF int stbi_write_force_png_filter;
 
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png16(char const *filename, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
@@ -214,6 +224,7 @@ STBIWDEF int stbiw_convert_wchar_to_utf8(char *buffer, size_t bufferlen, const w
 typedef void stbi_write_func(void *context, void *data, int size);
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
+STBIWDEF int stbi_write_png16_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, ptrdiff_t stride_in_bytes);
 STBIWDEF int stbi_write_bmp_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_tga_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data);
 STBIWDEF int stbi_write_hdr_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const float *data);
@@ -1304,7 +1315,11 @@ static void stbiw__encode_png_line(unsigned char *pixels, ptrdiff_t stride_bytes
    }
 }
 
-STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+// if is_16 is non-zero, 'pixels' is an array of 16-bit samples in the
+// platform's native byte order (2*n bytes per pixel), and a 16-bit PNG
+// (which stores samples big-endian) is written. 'stride_bytes' is always
+// measured in bytes.
+static unsigned char *stbiw__write_png_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len, int is_16)
 {
    int force_filter = stbi_write_force_png_filter;
    int ctype[5] = { -1, 0, 4, 2, 6 };
@@ -1312,35 +1327,61 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    unsigned char *out,*o, *filt, *zlib;
    signed char *line_buffer;
    int j,zlen;
+   int bpp; // bytes per pixel in the filtered data (n for 8-bit, 2*n for 16-bit)
+   unsigned char *be = 0; // big-endian conversion buffer for 16-bit data
 
    if (!stbiw__validate_dimensions(x, y, n))
       return 0;
 
+   bpp = n * (is_16 ? 2 : 1);
+
    if (stride_bytes == 0)
-      stride_bytes = x * n;
+      stride_bytes = x * bpp;
 
    if (force_filter >= 5) {
       force_filter = -1;
    }
 
-   if (!stbiw__mad2sizes_valid(x,n,1)) return 0;
-   if (!stbiw__mul2sizes_valid((x*n+1),y)) return 0;
+   if (!stbiw__mad2sizes_valid(x,bpp,1)) return 0;
+   if (!stbiw__mul2sizes_valid((x*bpp+1),y)) return 0;
+   if (is_16 && !stbiw__mul2sizes_valid(x*bpp,y)) return 0;
 
-   filt = (unsigned char *) STBIW_MALLOC((x*n+1) * y); if (!filt) return 0;
-   line_buffer = (signed char *) STBIW_MALLOC(x * n); if (!line_buffer) { STBIW_FREE(filt); return 0; }
+   if (is_16) {
+      // PNG stores 16-bit samples big-endian; convert the (native byte
+      // order) input to a contiguous big-endian buffer up front so the
+      // filtering code below can treat both cases identically.
+      int k, rowbytes = x*bpp;
+      be = (unsigned char *) STBIW_MALLOC(rowbytes * y);
+      if (!be) return 0;
+      for (j=0; j < y; ++j) {
+         const unsigned char *src = pixels + j*stride_bytes;
+         unsigned char *dst = be + j*rowbytes;
+         for (k=0; k < x*n; ++k) {
+            unsigned short v;
+            STBIW_MEMMOVE(&v, src + 2*k, 2);
+            dst[2*k  ] = (unsigned char) (v >> 8);
+            dst[2*k+1] = (unsigned char) (v & 255);
+         }
+      }
+      pixels = be;
+      stride_bytes = rowbytes;
+   }
+
+   filt = (unsigned char *) STBIW_MALLOC((x*bpp+1) * y); if (!filt) { STBIW_FREE(be); return 0; }
+   line_buffer = (signed char *) STBIW_MALLOC(x * bpp); if (!line_buffer) { STBIW_FREE(filt); STBIW_FREE(be); return 0; }
    for (j=0; j < y; ++j) {
       int filter_type;
       if (force_filter > -1) {
          filter_type = force_filter;
-         stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, n, force_filter, line_buffer);
+         stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, bpp, force_filter, line_buffer);
       } else { // Estimate the best filter by running through all of them:
          int best_filter = 0, best_filter_val = 0x7fffffff, est, i;
          for (filter_type = 0; filter_type < 5; filter_type++) {
-            stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, n, filter_type, line_buffer);
+            stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, bpp, filter_type, line_buffer);
 
             // Estimate the entropy of the line using this filter; the less, the better.
             est = 0;
-            for (i = 0; i < x*n; ++i) {
+            for (i = 0; i < x*bpp; ++i) {
                est += abs((signed char) line_buffer[i]);
             }
             if (est < best_filter_val) {
@@ -1349,16 +1390,17 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
             }
          }
          if (filter_type != best_filter) {  // If the last iteration already got us the best filter, don't redo it
-            stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, n, best_filter, line_buffer);
+            stbiw__encode_png_line((unsigned char*)(pixels), stride_bytes, x, y, j, bpp, best_filter, line_buffer);
             filter_type = best_filter;
          }
       }
       // when we get here, filter_type contains the filter type, and line_buffer contains the data
-      filt[j*(x*n+1)] = (unsigned char) filter_type;
-      STBIW_MEMMOVE(filt+j*(x*n+1)+1, line_buffer, x*n);
+      filt[j*(x*bpp+1)] = (unsigned char) filter_type;
+      STBIW_MEMMOVE(filt+j*(x*bpp+1)+1, line_buffer, x*bpp);
    }
    STBIW_FREE(line_buffer);
-   zlib = stbi_zlib_compress(filt, y*( x*n+1), &zlen, stbi_write_png_compression_level);
+   STBIW_FREE(be);
+   zlib = stbi_zlib_compress(filt, y*( x*bpp+1), &zlen, stbi_write_png_compression_level);
    STBIW_FREE(filt);
    if (!zlib) return 0;
 
@@ -1373,7 +1415,7 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    stbiw__wptag(o, "IHDR");
    stbiw__wp32(o, x);
    stbiw__wp32(o, y);
-   *o++ = 8;
+   *o++ = STBIW_UCHAR(is_16 ? 16 : 8);
    *o++ = STBIW_UCHAR(ctype[n]);
    *o++ = 0;
    *o++ = 0;
@@ -1396,6 +1438,16 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdi
    return out;
 }
 
+STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+{
+   return stbiw__write_png_to_mem(pixels, stride_bytes, x, y, n, out_len, 0);
+}
+
+STBIWDEF unsigned char *stbi_write_png16_to_mem(const unsigned char *pixels, ptrdiff_t stride_bytes, int x, int y, int n, int *out_len)
+{
+   return stbiw__write_png_to_mem(pixels, stride_bytes, x, y, n, out_len, 1);
+}
+
 #ifndef STBI_WRITE_NO_STDIO
 STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
@@ -1411,12 +1463,37 @@ STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const 
    STBIW_FREE(png);
    return 1;
 }
+
+STBIWDEF int stbi_write_png16(char const *filename, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
+{
+   FILE *f;
+   int len;
+   unsigned char *png = stbi_write_png16_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
+   if (png == NULL) return 0;
+
+   f = stbiw__fopen(filename, "wb");
+   if (!f) { STBIW_FREE(png); return 0; }
+   fwrite(png, 1, len, f);
+   fclose(f);
+   STBIW_FREE(png);
+   return 1;
+}
 #endif
 
 STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
 {
    int len;
    unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
+   if (png == NULL) return 0;
+   func(context, png, len);
+   STBIW_FREE(png);
+   return 1;
+}
+
+STBIWDEF int stbi_write_png16_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, ptrdiff_t stride_bytes)
+{
+   int len;
+   unsigned char *png = stbi_write_png16_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
    if (png == NULL) return 0;
    func(context, png, len);
    STBIW_FREE(png);
@@ -1828,6 +1905,9 @@ STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const 
 #endif // STB_IMAGE_WRITE_IMPLEMENTATION
 
 /* Revision history
+      1.19  (2026-11-20)
+             16-bit PNG writing: stbi_write_png16, stbi_write_png16_to_func,
+             stbi_write_png16_to_mem
       1.16  (2021-07-11)
              make Deflate code emit uncompressed blocks when it would otherwise expand
              support writing BMPs with alpha channel
