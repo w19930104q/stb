@@ -1,4 +1,4 @@
-/* stb_image - v2.33 - public domain image loader - http://nothings.org/stb
+/* stb_image - v2.34 - public domain image loader - http://nothings.org/stb
                                   no warranty implied; use at your own risk
 
    == SECURITY NOTE ==
@@ -64,6 +64,7 @@ LICENSE
 
 RECENT REVISION HISTORY:
 
+      2.34  (2026-11-20) PNG: gamma-correct gAMA chunk images to sRGB
       2.33  (2026-11-19) bugfixes
       2.32  (2026-11-12) fix req_comp regression; other fixes
       2.31  (2026-11-08) many bugfixes and etc.
@@ -136,6 +137,16 @@ RECENT REVISION HISTORY:
 //    - no 12-bit-per-channel JPEG
 //    - no JPEGs with arithmetic coding
 //    - GIF always returns *comp=4
+//
+// PNG gamma handling:
+//    PNG files may carry a gAMA chunk recording the gamma of the transfer
+//    curve used to encode their samples. When such a chunk is present, the
+//    loader converts the color (non-alpha) channels to sRGB using the declared
+//    gamma, so the decoded pixels match an sRGB reference decode. Files with
+//    no gAMA chunk, and files marked with an sRGB chunk (or the equivalent
+//    gAMA value ~45455), are returned byte-for-byte unchanged. The alpha
+//    channel is never gamma-corrected. Both 8-bit and 16-bit output, and the
+//    grayscale/RGB/palette/alpha paths, follow the same rule.
 //
 // Basic usage (see HDR discussion below for HDR usage):
 //    int x,y,n;
@@ -4712,6 +4723,8 @@ typedef struct
    stbi_uc *idata, *expanded, *out;
    int depth;
    int is_iphone;
+   // value from the gAMA chunk (PNG gamma * 100000), or 0 if the chunk is absent
+   stbi__uint32 png_gamma;
 } stbi__png;
 
 
@@ -5155,6 +5168,87 @@ static void stbi__de_iphone(stbi__png *z)
 
 #define STBI__PNG_TYPE(a,b,c,d)  (((unsigned) (a) << 24) + ((unsigned) (b) << 16) + ((unsigned) (c) << 8) + (unsigned) (d))
 
+// PNG's gAMA chunk stores the image's encoding gamma as 1/gamma * 100000.
+// An sRGB-encoded image has effective encoding gamma ~1/2.2 (gAMA 45455); the
+// rounded value 45454 produces an identical lookup table as well. Treat those
+// as already sRGB and leave the pixels untouched. Any other value gets the
+// full correction so the output matches a precise reference decode.
+#ifndef STBI_GAMMA_SRGB
+#define STBI_GAMMA_SRGB 45455
+#endif
+
+static int stbi__png_gamma_needs_correction(stbi__uint32 png_gamma)
+{
+   return png_gamma != 0 &&
+          png_gamma != STBI_GAMMA_SRGB && png_gamma != STBI_GAMMA_SRGB - 1;
+}
+
+// build a lookup table mapping source sample values (in the image's declared
+// gamma space) to sRGB-encoded values of the same bit depth
+static void *stbi__png_build_gamma_lut(stbi__png *z, int depth)
+{
+   int i, n = (depth == 16 ? 65536 : 256);
+   double inv_max = 1.0 / (n - 1);
+   // linear = s^(100000/gAMA); sRGB  = linear^(1/2.2) = s^(100000/(gAMA*2.2))
+   double exponent = 100000.0 / ((double) z->png_gamma * 2.2);
+   if (depth == 16) {
+      stbi__uint16 *lut = (stbi__uint16 *) stbi__malloc_mad2(n, (int) sizeof(stbi__uint16), 0);
+      if (!lut) { stbi__err("outofmem", "Out of memory"); return NULL; }
+      for (i=0; i < n; ++i) {
+         double v = pow(i * inv_max, exponent) * (n - 1) + 0.5;
+         if (v > n - 1) v = n - 1;
+         lut[i] = (stbi__uint16) v;
+      }
+      return lut;
+   } else {
+      stbi_uc *lut = (stbi_uc *) stbi__malloc(n);
+      if (!lut) { stbi__err("outofmem", "Out of memory"); return NULL; }
+      for (i=0; i < n; ++i) {
+         double v = pow(i * inv_max, exponent) * (n - 1) + 0.5;
+         if (v > n - 1) v = n - 1;
+         lut[i] = (stbi_uc) v;
+      }
+      return lut;
+   }
+}
+
+// apply the gamma LUT to the color channels of the decoded image; the alpha
+// channel (if any) is always the last component and is left alone
+static int stbi__png_apply_gamma(stbi__png *z, int out_n)
+{
+   stbi__context *s = z->s;
+   stbi__uint32 pixel_count = s->img_x * s->img_y, i;
+   int has_alpha = (out_n == 2 || out_n == 4), k;
+   int color_n = has_alpha ? out_n - 1 : out_n;
+   void *lut;
+
+   if (!stbi__png_gamma_needs_correction(z->png_gamma)) return 1;
+
+   lut = stbi__png_build_gamma_lut(z, z->depth);
+   if (!lut) return 0;
+
+   if (z->depth == 16) {
+      stbi__uint16 *lut16 = (stbi__uint16 *) lut;
+      stbi__uint16 *p = (stbi__uint16 *) z->out;
+      for (i=0; i < pixel_count; ++i) {
+         for (k=0; k < color_n; ++k)
+            p[k] = lut16[p[k]];
+         p += out_n;
+      }
+   } else {
+      stbi_uc *lut8 = (stbi_uc *) lut;
+      stbi_uc *p = z->out;
+      for (i=0; i < pixel_count; ++i) {
+         for (k=0; k < color_n; ++k)
+            p[k] = lut8[p[k]];
+         p += out_n;
+      }
+   }
+
+   STBI_FREE(lut);
+   return 1;
+}
+
 static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
 {
    stbi_uc palette[1024], pal_img_n=0;
@@ -5168,6 +5262,7 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
    z->idata = NULL;
    z->out = NULL;
    z->is_iphone = 0;
+   z->png_gamma = 0;
 
    if (!stbi__check_png_header(s)) return 0;
 
@@ -5253,6 +5348,24 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             break;
          }
 
+         case STBI__PNG_TYPE('g','A','M','A'): {
+            if (first) return stbi__err("first not IHDR", "Corrupt PNG");
+            // a gAMA chunk after IDAT can no longer affect the decoded pixels;
+            // ignore it rather than failing on a loadable file
+            if (c.length != 4 || z->idata) { stbi__skip(s, c.length); break; }
+            z->png_gamma = stbi__get32be(s);
+            break;
+         }
+
+         case STBI__PNG_TYPE('s','R','G','B'): {
+            if (first) return stbi__err("first not IHDR", "Corrupt PNG");
+            // an explicit sRGB chunk means the samples are already sRGB;
+            // consume the rendering-intent byte and suppress any gAMA correction
+            stbi__skip(s, c.length);
+            if (!z->idata) z->png_gamma = STBI_GAMMA_SRGB;
+            break;
+         }
+
          case STBI__PNG_TYPE('I','D','A','T'): {
             if (first) return stbi__err("first not IHDR", "Corrupt PNG");
             if (pal_img_n && !pal_len) return stbi__err("no PLTE","Corrupt PNG");
@@ -5297,13 +5410,6 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             else
                s->img_out_n = s->img_n;
             if (!stbi__create_png_image(z, z->expanded, raw_len, s->img_out_n, z->depth, color, interlace)) return 0;
-            if (has_trans) {
-               if (z->depth == 16) {
-                  if (!stbi__compute_transparency16(z, tc16, s->img_out_n)) return 0;
-               } else {
-                  if (!stbi__compute_transparency(z, tc, s->img_out_n)) return 0;
-               }
-            }
             if (z->is_iphone && stbi__de_iphone_flag && s->img_out_n > 2)
                stbi__de_iphone(z);
             if (pal_img_n) {
@@ -5316,6 +5422,33 @@ static int stbi__parse_png_file(stbi__png *z, int scan, int req_comp)
             } else if (has_trans) {
                // non-paletted image with tRNS -> source image has (constant) alpha
                ++s->img_n;
+            }
+            // apply the gAMA-declared gamma correction to the finished image
+            // (after palette expansion so the LUT runs once, not per palette entry)
+            if (!stbi__png_apply_gamma(z, s->img_out_n)) return 0;
+            // gamma-correct the tRNS key colors with the same LUT so they can be
+            // matched against the now-corrected pixels
+            if (has_trans && !pal_img_n && stbi__png_gamma_needs_correction(z->png_gamma)) {
+               if (z->depth == 16) {
+                  stbi__uint16 *lut16 = (stbi__uint16 *) stbi__png_build_gamma_lut(z, 16);
+                  if (!lut16) return 0;
+                  for (k=0; k < s->img_n && k < 3; ++k)
+                     tc16[k] = lut16[tc16[k]];
+                  STBI_FREE(lut16);
+               } else {
+                  stbi_uc *lut8 = (stbi_uc *) stbi__png_build_gamma_lut(z, 8);
+                  if (!lut8) return 0;
+                  for (k=0; k < s->img_n && k < 3; ++k)
+                     tc[k] = lut8[tc[k]];
+                  STBI_FREE(lut8);
+               }
+            }
+            if (has_trans) {
+               if (z->depth == 16) {
+                  if (!stbi__compute_transparency16(z, tc16, s->img_out_n)) return 0;
+               } else {
+                  if (!stbi__compute_transparency(z, tc, s->img_out_n)) return 0;
+               }
             }
             STBI_FREE(z->expanded); z->expanded = NULL;
             // end of PNG chunk, read and skip CRC

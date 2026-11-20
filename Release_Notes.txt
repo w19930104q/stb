@@ -1,3 +1,11 @@
+2026-11-20
+
+---- stb_image.h
+
+- PNG: honor the gAMA chunk and gamma-correct color channels to sRGB;
+  files without gAMA (or marked sRGB) decode unchanged, alpha is not
+  corrected, and 8-bit/16-bit outputs follow the same rule
+
 2026-11-19
 
 ---- stb_image.h
