@@ -1315,6 +1315,9 @@ static void stbi__vertical_flip(void *image, int w, int h, int bytes_per_pixel)
    }
 }
 
+// defined further below, alongside stbi__convert_format
+static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int req_comp, unsigned int x, unsigned int y);
+
 static unsigned char *stbi__load_and_postprocess_8bit(stbi__context *s, int *x, int *y, int *comp, int req_comp)
 {
    stbi__result_info ri;
@@ -1344,7 +1347,13 @@ static unsigned char *stbi__load_and_postprocess_8bit(stbi__context *s, int *x, 
 static stbi__uint16 *stbi__load_and_postprocess_16bit(stbi__context *s, int *x, int *y, int *comp, int req_comp)
 {
    stbi__result_info ri;
-   void *result = stbi__load_main(s, x, y, comp, req_comp, &ri, 16);
+   // when the requested output is Y or YA, the channel conversion may compute
+   // luminance from RGB; if we let the loaders do that conversion in 8 bits
+   // and only then expand to 16 bits, the result has just 256 distinct levels
+   // (visible banding). so for these targets, load the native channels and
+   // convert to Y/YA only after expanding to 16 bits, keeping full precision.
+   int defer_y_conversion = (req_comp == 1 || req_comp == 2);
+   void *result = stbi__load_main(s, x, y, comp, defer_y_conversion ? 0 : req_comp, &ri, 16);
 
    if (result == NULL)
       return NULL;
@@ -1353,12 +1362,19 @@ static stbi__uint16 *stbi__load_and_postprocess_16bit(stbi__context *s, int *x, 
    STBI_ASSERT(ri.bits_per_channel == 8 || ri.bits_per_channel == 16);
 
    if (ri.bits_per_channel != 16) {
-      result = stbi__convert_8_to_16((stbi_uc *) result, *x, *y, req_comp == 0 ? *comp : req_comp);
+      result = stbi__convert_8_to_16((stbi_uc *) result, *x, *y, defer_y_conversion ? *comp : (req_comp == 0 ? *comp : req_comp));
       ri.bits_per_channel = 16;
+      if (result == NULL)
+         return NULL;
    }
 
    // @TODO: move stbi__convert_format16 to here
-   // @TODO: special case RGB-to-Y (and RGBA-to-YA) for 8-bit-to-16-bit case to keep more precision
+   if (defer_y_conversion) {
+      // *comp is the native channel count since we loaded with req_comp == 0
+      result = stbi__convert_format16((stbi__uint16 *) result, *comp, req_comp, *x, *y);
+      if (result == NULL)
+         return NULL;
+   }
 
    if (stbi__vertically_flip_on_load) {
       int channels = req_comp ? req_comp : *comp;
@@ -1861,18 +1877,11 @@ static unsigned char *stbi__convert_format(unsigned char *data, int img_n, int r
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
-// nothing
-#else
 static stbi__uint16 stbi__compute_y_16(int r, int g, int b)
 {
    return (stbi__uint16) (((r*77) + (g*150) +  (29*b)) >> 8);
 }
-#endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
-// nothing
-#else
 static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int req_comp, unsigned int x, unsigned int y)
 {
    int i,j;
@@ -1916,7 +1925,6 @@ static stbi__uint16 *stbi__convert_format16(stbi__uint16 *data, int img_n, int r
    STBI_FREE(data);
    return good;
 }
-#endif
 
 #ifndef STBI_NO_LINEAR
 static float   *stbi__ldr_to_hdr(stbi_uc *data, int x, int y, int comp)
